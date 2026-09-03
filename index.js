@@ -354,11 +354,72 @@ function uninstallFetchPatch() {
 
 // ─── Dashboard ─────────────────────────────────────────────────────
 
+// ─── Critical CSS (injected from JS) ───────────────────────────────
+// style.css may fail to load (manifest/caching issues, custom CSS order).
+// Without it the panel renders as an unstyled block at the bottom of the
+// page and looks like "nothing happened". These rules are self-contained
+// and use !important so nothing in the theme can hide the panel.
+function injectCriticalCss() {
+    if (document.getElementById('retry-dashboard-critical-css')) return;
+    const css = `
+#retry-dashboard-panel {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    z-index: 2147483000 !important;
+    background: rgba(0,0,0,0.88) !important;
+    overflow-y: auto !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    pointer-events: auto !important;
+}
+#retry-dashboard-panel[hidden] { display: none !important; }
+#retry-dashboard-panel .retry-dashboard-inner {
+    max-width: 1100px; margin: 40px auto; padding: 20px;
+    color: var(--SmartThemeBodyColor, #e0e0e0);
+}
+#retry-dashboard-panel .retry-dashboard-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px; padding-bottom: 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #333);
+}
+#retry-dashboard-panel .retry-dashboard-close,
+#retry-dashboard-panel .retry-filter-btn,
+#retry-dashboard-panel .retry-clear-btn {
+    cursor: pointer; background: rgba(255,255,255,0.08);
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px; padding: 6px 14px;
+    color: var(--SmartThemeBodyColor, #e0e0e0);
+}
+#retry-dashboard-panel .retry-dashboard-stats,
+#retry-dashboard-panel .retry-dashboard-filters {
+    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;
+}
+#retry-dashboard-panel .retry-log-entry {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 8px; margin-bottom: 8px; overflow: hidden;
+}
+#retry-dashboard-panel .retry-log-summary {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer;
+}
+#retry-dashboard-panel .retry-log-detail { display: none; padding: 0 14px 14px 44px; }
+#retry-dashboard-panel .retry-log-entry.expanded .retry-log-detail { display: block; }
+#retry-dashboard-panel .retry-log-empty { opacity: 0.6; padding: 20px; text-align: center; }
+`;
+    const style = document.createElement('style');
+    style.id = 'retry-dashboard-critical-css';
+    style.textContent = css;
+    document.head.appendChild(style);
+}
+
+
 let dashboardFilter = 'all';
 
 function buildDashboardHTML() {
     return `
-    <div id="retry-dashboard-panel">
+    <div id="retry-dashboard-panel" hidden>
         <div class="retry-dashboard-inner">
             <div class="retry-dashboard-header">
                 <div class="retry-dashboard-title">
@@ -552,21 +613,13 @@ $(document).on('click', '.retry-log-summary', function () {
 
 function openDashboard() {
     log('openDashboard() called');
+    injectCriticalCss();
 
-    if ($('#retry-dashboard-panel').length === 0) {
-        log('Dashboard panel does not exist yet, building...');
+    if (document.getElementById('retry-dashboard-panel') === null) {
         $(document.body).append(buildDashboardHTML());
-        $('#retry-dashboard-panel').css('display', 'none');
 
-        // Escape closes the dashboard.
-        $(document).on('keydown.retryDashboard', function (e) {
-            if (e.key === 'Escape') {
-                $('#retry-dashboard-panel').css('display', 'none');
-            }
-        });
-
-        $('#retry_dashboard_close').on('click', function () {
-            $('#retry-dashboard-panel').css('display', 'none');
+        $(document).on('click', '#retry_dashboard_close', function () {
+            closeDashboard();
         });
 
         // Use document-level delegated handlers so they survive re-renders
@@ -583,15 +636,41 @@ function openDashboard() {
             }
         });
 
+        $(document).on('keydown.retryDashboard', function (e) {
+            if (e.key === 'Escape') closeDashboard();
+        });
+
         log('Dashboard panel built and event handlers attached.');
     }
+
     renderDashboardLogs();
-    // Explicitly set display — do NOT rely on jQuery .show() which only
-    // clears inline display:none, falling back to CSS rules that might
-    // still say display:none.
-    $('#retry-dashboard-panel').css('display', 'block');
-    log('Dashboard should now be visible. Display:', $('#retry-dashboard-panel').css('display'));
+
+    // Move the panel to be the LAST child of <body> so nothing paints over it,
+    // and force the critical layout properties inline.
+    const panel = document.getElementById('retry-dashboard-panel');
+    document.body.appendChild(panel);
+    panel.removeAttribute('hidden');
+    panel.style.cssText =
+        'display:block;position:fixed;inset:0;width:100%;height:100%;' +
+        'z-index:2147483000;background:rgba(0,0,0,0.88);overflow-y:auto;' +
+        'opacity:1;visibility:visible;pointer-events:auto;';
+
+    const rect = panel.getBoundingClientRect();
+    log('Dashboard opened. size=', Math.round(rect.width) + 'x' + Math.round(rect.height),
+        'computedDisplay=', getComputedStyle(panel).display);
 }
+
+function closeDashboard() {
+    const panel = document.getElementById('retry-dashboard-panel');
+    if (panel) {
+        panel.style.display = 'none';
+        panel.setAttribute('hidden', 'hidden');
+    }
+}
+
+// Escape hatch for debugging: run openRetryDashboard() in the browser console.
+window.openRetryDashboard = openDashboard;
+window.closeRetryDashboard = closeDashboard;
 
 // ─── Nav Button ────────────────────────────────────────────────────
 
@@ -637,7 +716,8 @@ function addNavButton() {
         if (retries <= 0) return;
         if ($('#extensionsMenu').length > 0 && $('#retry_dashboard_nav').length === 0) {
             const navItem = $(`
-                <div id="retry_dashboard_nav" class="menu_button" title="Retry On Error Dashboard" tabindex="0"
+                <div id="retry_dashboard_nav" class="list-group-item flex-container flexGap5 interactable"
+                     title="Retry On Error Dashboard" tabindex="0"
                      style="cursor:pointer;display:flex;align-items:center;gap:6px;">
                     <i class="fa-solid fa-rotate-right"></i>
                     <span>Retry Logs</span>
@@ -645,11 +725,35 @@ function addNavButton() {
             `);
             $('#extensionsMenu').append(navItem);
             log('Nav button added to extensions wand menu.');
-        } else if ($('#extensionsMenu').length === 0) {
+        } else {
             setTimeout(() => tryAddToWandMenu(retries - 1), 500);
         }
     }
-    tryAddToWandMenu(20); // retry for up to 10 seconds
+    tryAddToWandMenu(40);
+    // The wand menu can be re-created by SillyTavern; keep re-adding the item.
+    setInterval(() => {
+        if ($('#extensionsMenu').length > 0 && $('#retry_dashboard_nav').length === 0) {
+            tryAddToWandMenu(1);
+        }
+    }, 3000);
+
+    // Native capture-phase listener: fires before any other handler and works
+    // even if a theme/extension stops propagation on the wand menu.
+    if (!window.__retryNavListener) {
+        window.__retryNavListener = true;
+        document.addEventListener('click', function (e) {
+            const target = e.target && e.target.closest
+                ? e.target.closest('#retry_dashboard_nav, #retry_dashboard_open_btn, #retry_dashboard_fab')
+                : null;
+            if (!target) return;
+            e.preventDefault();
+            e.stopPropagation();
+            log('Dashboard trigger clicked (capture):', target.id);
+            const menu = document.getElementById('extensionsMenu');
+            if (menu) menu.style.display = 'none';
+            openDashboard();
+        }, true);
+    }
 
     // Delegated click handler for BOTH the settings-panel button and the
     // wand-menu item. The wand-menu item previously had no handler at all,
@@ -808,6 +912,7 @@ function renderSettingsUI() {
 
 jQuery(async () => {
     getSettings();
+    injectCriticalCss();
     installFetchPatch();
     renderSettingsUI();
     addNavButton();
