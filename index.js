@@ -117,7 +117,7 @@ function addLogEntry(entry) {
     saveSettingsDebounced();
     // If dashboard is open, refresh it
     if ($('#retry-dashboard-panel').is(':visible')) {
-        renderDashboardLogs();
+        safeRenderDashboardLogs();
     }
 }
 
@@ -125,7 +125,7 @@ function clearLogs() {
     const settings = getSettings();
     settings.logs = [];
     saveSettingsDebounced();
-    renderDashboardLogs();
+    safeRenderDashboardLogs();
 }
 
 // ─── Toast ─────────────────────────────────────────────────────────
@@ -611,10 +611,8 @@ $(document).on('click', '.retry-log-summary', function () {
     $(this).closest('.retry-log-entry').toggleClass('expanded');
 });
 
-function openDashboard() {
-    log('openDashboard() called');
+function ensureDashboardPanel() {
     injectCriticalCss();
-
     if (document.getElementById('retry-dashboard-panel') === null) {
         $(document.body).append(buildDashboardHTML());
 
@@ -627,7 +625,7 @@ function openDashboard() {
             $('.retry-filter-btn').removeClass('active');
             $(this).addClass('active');
             dashboardFilter = $(this).data('filter');
-            renderDashboardLogs();
+            safeRenderDashboardLogs();
         });
 
         $(document).on('click', '#retry_dashboard_clear', function () {
@@ -642,22 +640,56 @@ function openDashboard() {
 
         log('Dashboard panel built and event handlers attached.');
     }
+    return document.getElementById('retry-dashboard-panel');
+}
 
-    renderDashboardLogs();
+function safeRenderDashboardLogs() {
+    try {
+        renderDashboardLogs();
+    } catch (err) {
+        // A single malformed log entry must never keep the panel from opening.
+        console.error('[Retry On Error] Failed to render logs:', err);
+        $('#retry_dashboard_log_list').html(
+            '<div class="retry-log-empty">Could not render the log list (' +
+            escapeHtml(err && err.message ? err.message : String(err)) +
+            ').<br>Use "Clear Logs" to reset it.</div>',
+        );
+    }
+}
 
-    // Move the panel to be the LAST child of <body> so nothing paints over it,
-    // and force the critical layout properties inline.
-    const panel = document.getElementById('retry-dashboard-panel');
-    document.body.appendChild(panel);
-    panel.removeAttribute('hidden');
-    panel.style.cssText =
-        'display:block;position:fixed;inset:0;width:100%;height:100%;' +
-        'z-index:2147483000;background:rgba(0,0,0,0.88);overflow-y:auto;' +
-        'opacity:1;visibility:visible;pointer-events:auto;';
+function openDashboard() {
+    try {
+        log('openDashboard() called');
+        const panel = ensureDashboardPanel();
+        if (!panel) throw new Error('panel could not be created');
 
-    const rect = panel.getBoundingClientRect();
-    log('Dashboard opened. size=', Math.round(rect.width) + 'x' + Math.round(rect.height),
-        'computedDisplay=', getComputedStyle(panel).display);
+        // Show the panel FIRST. Rendering the log list happens afterwards so a
+        // rendering error can never leave the panel invisible ("nothing happens").
+        // Re-parent to <html> so a transformed/overflow-hidden <body> (common on
+        // mobile themes) cannot clip or hide the fixed overlay.
+        document.documentElement.appendChild(panel);
+        panel.removeAttribute('hidden');
+        panel.style.cssText =
+            'display:block;position:fixed;top:0;left:0;right:0;bottom:0;width:100%;' +
+            'height:100vh;height:100dvh;max-height:100dvh;' +
+            'z-index:2147483000;background:rgba(0,0,0,0.92);overflow-y:auto;' +
+            '-webkit-overflow-scrolling:touch;opacity:1;visibility:visible;pointer-events:auto;';
+
+        safeRenderDashboardLogs();
+
+        const rect = panel.getBoundingClientRect();
+        log('Dashboard opened. size=', Math.round(rect.width) + 'x' + Math.round(rect.height),
+            'computedDisplay=', getComputedStyle(panel).display);
+    } catch (err) {
+        console.error('[Retry On Error] openDashboard failed:', err);
+        try {
+            if (typeof toastr !== 'undefined') {
+                toastr.error(String(err && err.message ? err.message : err), 'Retry Dashboard failed to open');
+            } else {
+                alert('Retry Dashboard failed to open: ' + err);
+            }
+        } catch { /* ignore */ }
+    }
 }
 
 function closeDashboard() {
@@ -741,7 +773,7 @@ function addNavButton() {
     // even if a theme/extension stops propagation on the wand menu.
     if (!window.__retryNavListener) {
         window.__retryNavListener = true;
-        document.addEventListener('click', function (e) {
+        const captureTrigger = function (e) {
             const target = e.target && e.target.closest
                 ? e.target.closest('#retry_dashboard_nav, #retry_dashboard_open_btn, #retry_dashboard_fab')
                 : null;
@@ -752,7 +784,11 @@ function addNavButton() {
             const menu = document.getElementById('extensionsMenu');
             if (menu) menu.style.display = 'none';
             openDashboard();
-        }, true);
+        };
+        document.addEventListener('click', captureTrigger, true);
+        // Some mobile webviews (Brave/Android) swallow the synthetic click on
+        // menu_button divs — touchend guarantees the dashboard still opens.
+        document.addEventListener('touchend', captureTrigger, true);
     }
 
     // Delegated click handler for BOTH the settings-panel button and the
@@ -910,11 +946,30 @@ function renderSettingsUI() {
 
 // ─── Init ──────────────────────────────────────────────────────────
 
+function safely(label, fn) {
+    try {
+        fn();
+    } catch (err) {
+        console.error('[Retry On Error] ' + label + ' failed:', err);
+    }
+}
+
 jQuery(async () => {
-    getSettings();
-    injectCriticalCss();
-    installFetchPatch();
-    renderSettingsUI();
-    addNavButton();
+    safely('getSettings', getSettings);
+    safely('injectCriticalCss', injectCriticalCss);
+    safely('installFetchPatch', installFetchPatch);
+    // Settings UI must never be able to take the nav/dashboard buttons down
+    // with it — each step is isolated.
+    safely('renderSettingsUI', renderSettingsUI);
+    safely('addNavButton', addNavButton);
+
+    // Safety net: if anything above raced with SillyTavern's own DOM setup,
+    // make sure the floating dashboard button still ends up on the page.
+    setTimeout(() => {
+        if (document.getElementById('retry_dashboard_fab') === null) {
+            safely('addNavButton (retry)', addNavButton);
+        }
+    }, 4000);
+
     log('Initialized. Logs array has', getSettings().logs.length, 'entries.');
 });
