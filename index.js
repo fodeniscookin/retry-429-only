@@ -163,6 +163,29 @@ async function bodyMatchesKeyword(response, keywords) {
     }
 }
 
+// SillyTavern's own housekeeping endpoints. Retrying/logging these can cause
+// a feedback loop: a log entry triggers saveSettingsDebounced() -> fetch ->
+// which would itself be logged, forever.
+const INTERNAL_URL_PATTERNS = [
+    '/api/settings/save',
+    '/api/settings/get',
+    '/api/chats/save',
+    '/csrf-token',
+];
+
+function isInternalRequest(url) {
+    return INTERNAL_URL_PATTERNS.some((p) => url.includes(p));
+}
+
+// A request whose body is a stream (or a consumed Request object) cannot be
+// replayed, so retrying it would send an empty body.
+function isReplayable(input, init) {
+    const body = init && init.body;
+    if (body && typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return false;
+    if (typeof Request !== 'undefined' && input instanceof Request && input.bodyUsed) return false;
+    return true;
+}
+
 function extractUrl(input) {
     if (typeof input === 'string') return input;
     if (input && input.url) return input.url;
@@ -185,14 +208,16 @@ function installFetchPatch() {
     window.fetch = async function patchedFetch(input, init) {
         const settings = getSettings();
 
-        if (!settings.enabled) {
+        const requestUrl = extractUrl(input);
+
+        if (!settings.enabled || isInternalRequest(requestUrl) || !isReplayable(input, init)) {
             return originalFetch(input, init);
         }
 
         const externalSignal = init && init.signal ? init.signal : null;
         const retryableStatuses = getRetryableStatusSet(settings);
         const keywords = getKeywordList(settings);
-        const url = extractUrl(input);
+        const url = requestUrl;
         let attempt = 0;
         const attemptHistory = [];
         const startTime = Date.now();
@@ -438,7 +463,8 @@ function renderDashboardLogs() {
                 entry.type === 'success'
                     ? `${entry.retries} retries`
                     : `gave up after ${entry.retries}`;
-            const shortUrl = entry.url.length > 80 ? entry.url.slice(0, 77) + '...' : entry.url;
+            const entryUrl = entry.url || '(unknown)';
+            const shortUrl = entryUrl.length > 80 ? entryUrl.slice(0, 77) + '...' : entryUrl;
 
             const attemptsHtml =
                 entry.attempts && entry.attempts.length > 0
@@ -469,16 +495,16 @@ function renderDashboardLogs() {
 
             return `
             <div class="retry-log-entry ${typeClass}" data-index="${index}">
-                <div class="retry-log-summary" onclick="window.__retryToggleExpand(${index})">
+                <div class="retry-log-summary">
                     <span class="retry-log-status-icon ${typeClass}"><i class="${iconClass}"></i></span>
                     <span class="retry-log-badge">${escapeHtml(badgeText)}</span>
-                    <span class="retry-log-url" title="${escapeHtml(entry.url)}">${escapeHtml(shortUrl)}</span>
+                    <span class="retry-log-url" title="${escapeHtml(entryUrl)}">${escapeHtml(shortUrl)}</span>
                     <span class="retry-log-time">${escapeHtml(formatTime(entry.timestamp))}</span>
                 </div>
                 <div class="retry-log-detail" id="retry-log-detail-${index}">
                     <div class="retry-log-detail-row">
                         <span class="retry-log-detail-label">URL</span>
-                        <span class="retry-log-detail-value mono">${escapeHtml(entry.url)}</span>
+                        <span class="retry-log-detail-value mono">${escapeHtml(entryUrl)}</span>
                     </div>
                     <div class="retry-log-detail-row">
                         <span class="retry-log-detail-label">Method</span>
@@ -519,11 +545,10 @@ function renderDashboardLogs() {
     $('#retry_dashboard_log_list').html(html);
 }
 
-// Toggle expand for a log entry — exposed globally for inline onclick
-window.__retryToggleExpand = function (index) {
-    const $entry = $(`.retry-log-entry[data-index="${index}"]`);
-    $entry.toggleClass('expanded');
-};
+// Toggle expand for a log entry (delegated — CSP-safe, no inline onclick)
+$(document).on('click', '.retry-log-summary', function () {
+    $(this).closest('.retry-log-entry').toggleClass('expanded');
+});
 
 function openDashboard() {
     log('openDashboard() called');
@@ -531,6 +556,14 @@ function openDashboard() {
     if ($('#retry-dashboard-panel').length === 0) {
         log('Dashboard panel does not exist yet, building...');
         $(document.body).append(buildDashboardHTML());
+        $('#retry-dashboard-panel').css('display', 'none');
+
+        // Escape closes the dashboard.
+        $(document).on('keydown.retryDashboard', function (e) {
+            if (e.key === 'Escape') {
+                $('#retry-dashboard-panel').css('display', 'none');
+            }
+        });
 
         $('#retry_dashboard_close').on('click', function () {
             $('#retry-dashboard-panel').css('display', 'none');
@@ -618,12 +651,25 @@ function addNavButton() {
     }
     tryAddToWandMenu(20); // retry for up to 10 seconds
 
-    // Delegated click handler for the settings panel button (works even
-    // if the button is re-rendered)
-    $(document).on('click', '#retry_dashboard_open_btn', function (e) {
+    // Delegated click handler for BOTH the settings-panel button and the
+    // wand-menu item. The wand-menu item previously had no handler at all,
+    // which is why clicking the dashboard icon did nothing.
+    $(document).on('click', '#retry_dashboard_open_btn, #retry_dashboard_nav', function (e) {
         e.preventDefault();
-        log('Settings panel dashboard button clicked.');
+        e.stopPropagation();
+        log('Dashboard button clicked:', this.id);
+        // Close the wand menu / options popup if it is open.
+        $('#extensionsMenu').hide();
+        $('#options').hide();
         openDashboard();
+    });
+
+    // Keyboard accessibility for the wand-menu item.
+    $(document).on('keydown', '#retry_dashboard_nav', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            $(this).trigger('click');
+        }
     });
 }
 
