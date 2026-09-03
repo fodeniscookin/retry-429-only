@@ -526,76 +526,105 @@ window.__retryToggleExpand = function (index) {
 };
 
 function openDashboard() {
+    log('openDashboard() called');
+
     if ($('#retry-dashboard-panel').length === 0) {
+        log('Dashboard panel does not exist yet, building...');
         $(document.body).append(buildDashboardHTML());
 
         $('#retry_dashboard_close').on('click', function () {
-            $('#retry-dashboard-panel').hide();
+            $('#retry-dashboard-panel').css('display', 'none');
         });
 
-        $('.retry-filter-btn').on('click', function () {
+        // Use document-level delegated handlers so they survive re-renders
+        $(document).on('click', '.retry-filter-btn', function () {
             $('.retry-filter-btn').removeClass('active');
             $(this).addClass('active');
             dashboardFilter = $(this).data('filter');
             renderDashboardLogs();
         });
 
-        $('#retry_dashboard_clear').on('click', function () {
+        $(document).on('click', '#retry_dashboard_clear', function () {
             if (confirm('Clear all retry logs? This cannot be undone.')) {
                 clearLogs();
             }
         });
+
+        log('Dashboard panel built and event handlers attached.');
     }
     renderDashboardLogs();
-    $('#retry-dashboard-panel').show();
+    // Explicitly set display — do NOT rely on jQuery .show() which only
+    // clears inline display:none, falling back to CSS rules that might
+    // still say display:none.
+    $('#retry-dashboard-panel').css('display', 'block');
+    log('Dashboard should now be visible. Display:', $('#retry-dashboard-panel').css('display'));
 }
 
 // ─── Nav Button ────────────────────────────────────────────────────
 
 function addNavButton() {
-    // ST uses #extensionsMenu for the wand dropdown, and #sheld .nav-toggle
-    // for the right-side nav. We add a button to the top nav bar that matches
-    // existing nav buttons. ST's nav buttons live in #rightNavPanel or the
-    // top bar #top-bar. The most reliable approach: add to the extensions
-    // menu dropdown (wand menu) since that's where extension actions live.
-    //
-    // We also add a standalone floating button as a fallback so the dashboard
-    // is always accessible even if the wand menu structure changes.
-
-    // Approach 1: Add to extensions wand menu
-    const navItem = $(`
-        <div id="retry_dashboard_nav" class="menu_button" title="Retry On Error Dashboard" tabindex="0">
+    // Add a floating button to the bottom-right of the screen.
+    // This is the most reliable access point — it doesn't depend on
+    // #extensionsMenu existing at init time, and it's always visible.
+    const floatingBtn = $(`
+        <div id="retry_dashboard_fab"
+             style="position:fixed;bottom:20px;right:20px;z-index:9999;
+                    cursor:pointer;background:var(--black30a,rgba(0,0,0,0.5));
+                    border:1px solid var(--SmartThemeBorderColor,#555);
+                    border-radius:50%;width:48px;height:48px;
+                    display:flex;align-items:center;justify-content:center;
+                    color:var(--SmartThemeBodyColor,#e0e0e0);font-size:1.2em;
+                    transition:background 0.2s;box-shadow:0 2px 8px rgba(0,0,0,0.3);"
+             title="Retry On Error Dashboard">
             <i class="fa-solid fa-rotate-right"></i>
-            <span>Retry Logs</span>
         </div>
     `);
 
-    // Try to add to the extensions menu dropdown
-    if ($('#extensionsMenu').length > 0) {
-        $('#extensionsMenu').append(navItem);
-    }
-
-    // Approach 2: Also add a button in the extensions settings panel
-    const settingsButton = $(`
-        <div class="marginBot10">
-            <div class="menu_button menu_button_icon" id="retry_dashboard_open_btn" style="width:100%;text-align:center;">
-                <i class="fa-solid fa-chart-bar"></i>
-                <span>Open Retry Dashboard</span>
-            </div>
-        </div>
-    `);
-
-    // Insert after the retry-on-error settings drawer
-    // (added in renderSettingsUI, we append after it)
-
-    // Click handlers for both
-    $(document).on('click', '#retry_dashboard_nav, #retry_dashboard_open_btn', function (e) {
+    $(document).on('click', '#retry_dashboard_fab', function (e) {
         e.preventDefault();
+        e.stopPropagation();
+        log('Floating button clicked.');
         openDashboard();
     });
 
-    // Store the settings button to be appended in renderSettingsUI
-    window.__retrySettingsButton = settingsButton;
+    // Append floating button — try immediately, retry if body not ready
+    function appendFloating() {
+        if (document.body) {
+            $(document.body).append(floatingBtn);
+            log('Floating dashboard button appended.');
+        } else {
+            setTimeout(appendFloating, 200);
+        }
+    }
+    appendFloating();
+
+    // Also try to add to the extensions wand menu, but with retry logic
+    // since #extensionsMenu might not exist yet at init time.
+    function tryAddToWandMenu(retries) {
+        if (retries <= 0) return;
+        if ($('#extensionsMenu').length > 0 && $('#retry_dashboard_nav').length === 0) {
+            const navItem = $(`
+                <div id="retry_dashboard_nav" class="menu_button" title="Retry On Error Dashboard" tabindex="0"
+                     style="cursor:pointer;display:flex;align-items:center;gap:6px;">
+                    <i class="fa-solid fa-rotate-right"></i>
+                    <span>Retry Logs</span>
+                </div>
+            `);
+            $('#extensionsMenu').append(navItem);
+            log('Nav button added to extensions wand menu.');
+        } else if ($('#extensionsMenu').length === 0) {
+            setTimeout(() => tryAddToWandMenu(retries - 1), 500);
+        }
+    }
+    tryAddToWandMenu(20); // retry for up to 10 seconds
+
+    // Delegated click handler for the settings panel button (works even
+    // if the button is re-rendered)
+    $(document).on('click', '#retry_dashboard_open_btn', function (e) {
+        e.preventDefault();
+        log('Settings panel dashboard button clicked.');
+        openDashboard();
+    });
 }
 
 // ─── Settings UI ───────────────────────────────────────────────────
@@ -725,11 +754,8 @@ function renderSettingsUI() {
         saveSettingsDebounced();
     });
 
-    // Dashboard open button (in settings panel)
-    $('#retry_dashboard_open_btn').on('click', function (e) {
-        e.preventDefault();
-        openDashboard();
-    });
+    // Dashboard open button handler is delegated in addNavButton() —
+    // no direct binding needed here.
 }
 
 // ─── Init ──────────────────────────────────────────────────────────
