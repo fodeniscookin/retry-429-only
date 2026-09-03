@@ -1,2 +1,44 @@
-# retry-429-only
-Idk
+# 429 Retry Only
+
+A minimal SillyTavern extension that retries a request **only** when the
+server responds with HTTP 429 (rate limited). It does nothing for empty/short
+responses, timeouts, or any other error — so it won't cause the
+"double request in flight" problem that shared/free API proxies (which often
+allow only one concurrent request per key) are sensitive to.
+
+## What it does
+
+- Patches `window.fetch` so any 429 response triggers an automatic retry
+  with exponential backoff (+ optional jitter).
+- If the server sends a `Retry-After` header, it's honored by default.
+- Gives up and returns the 429 to the caller after your configured max
+  retries, so SillyTavern's normal error handling still kicks in eventually.
+- Everything else (200s, 500s, empty streams, etc.) passes straight through
+  untouched — this extension does not try to detect or "fix" short responses.
+
+## Install
+
+1. Copy this folder into your SillyTavern install at:
+   `SillyTavern/public/scripts/extensions/third-party/retry-429-only/`
+   (the folder should directly contain `manifest.json` and `index.js`)
+2. Restart SillyTavern (or reload the page).
+3. Open the Extensions panel (the puzzle-piece icon) — you'll see a
+   "429 Retry Only" section with settings:
+   - **Max retries** — how many times to retry before giving up (default 5)
+   - **Base delay (ms)** — starting backoff delay (default 1000ms)
+   - **Max delay (ms)** — cap on backoff delay (default 30000ms)
+   - **Honor Retry-After** — use the server's suggested wait time if provided
+   - **Jitter** — randomizes delay slightly so retries don't all land at once
+
+## Why this instead of "retry on empty/short response"
+
+Retrying because a response was empty/short means firing a *new* request
+while the old one might not have fully closed server-side — on a
+concurrency-limited backend (like a shared free-tier proxy), that reads as
+two simultaneous requests and gets rejected. Retrying only on 429 avoids
+that: you already know the server rejected the request outright, so there's
+nothing still "in flight" to collide with.
+
+If short responses are a real issue separately, that's better solved via
+`max_tokens` / response length settings on the model side, not an
+auto-retry.
