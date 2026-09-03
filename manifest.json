@@ -5,8 +5,8 @@
   "optional": [],
   "js": "index.js",
   "css": "style.css",
-  "author": "you",
-  "version": "1.1.0",
-  "homePage": "",
-  "auto_update": false
+  "author": "fodeniscookin",
+  "version": "1.1.1",
+  "homePage": "https://github.com/fodeniscookin/retry-429-only",
+  "auto_update": true
 }
