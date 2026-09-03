@@ -1,15 +1,12 @@
 // Retry On Error — SillyTavern extension
 // Retries a request when it fails via:
-//  1. Network errors (fetch throws)
+//  1. Network errors (fetch throws) — EXCLUDING user-initiated aborts (Stop button)
 //  2. Configurable HTTP error statuses (429, 500, 502, 503, 504, ...)
-//  3. A body-keyword scan — catches providers that return an error message
-//     inside a 200-status JSON body (e.g. "provider temporarily unavailable"),
-//     which a status-code check alone would never catch.
+//  3. A body-keyword scan for errors wrapped in a 200-status JSON body
 //
-// The body scan is skipped for streaming (SSE) responses so it never
-// consumes/breaks a real streaming generation — it only inspects
-// non-streaming JSON bodies, which is what most "wrapped error" responses
-// look like.
+// IMPORTANT: if the caller passed an AbortSignal (SillyTavern does this for
+// its "Stop" button) and that signal is aborted, we never retry — we
+// immediately propagate the abort so Stop actually stops generation.
 
 import { extension_settings, getContext } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -57,8 +54,18 @@ function getKeywordList(settings) {
         .filter(Boolean);
 }
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, ms);
+        if (signal) {
+            const onAbort = () => {
+                clearTimeout(timer);
+                reject(new DOMException('Aborted', 'AbortError'));
+            };
+            if (signal.aborted) return onAbort();
+            signal.addEventListener('abort', onAbort, { once: true });
+        }
+    });
 }
 
 function computeDelay(attempt, settings, retryAfterHeader) {
@@ -84,14 +91,35 @@ function log(...args) {
     console.log('[Retry On Error]', ...args);
 }
 
+// Single, reused toast element so repeated retries UPDATE one notification
+// instead of stacking a new one on top every attempt.
+let activeToast = null;
+
 function toast(message, type = 'info') {
     try {
-        if (typeof toastr !== 'undefined') {
-            toastr[type](message, 'Retry On Error');
+        if (typeof toastr === 'undefined') return;
+        if (activeToast) {
+            toastr.clear(activeToast);
         }
+        activeToast = toastr[type](message, 'Retry On Error', { timeOut: type === 'error' ? 4000 : 0 });
     } catch {
         // toastr not available, ignore
     }
+}
+
+function clearToast() {
+    try {
+        if (activeToast && typeof toastr !== 'undefined') {
+            toastr.clear(activeToast);
+        }
+    } catch {
+        // ignore
+    }
+    activeToast = null;
+}
+
+function isAbortError(err) {
+    return err && (err.name === 'AbortError' || err.code === 20);
 }
 
 function isStreamingResponse(response) {
@@ -101,15 +129,14 @@ function isStreamingResponse(response) {
 
 async function bodyMatchesKeyword(response, keywords) {
     if (keywords.length === 0) return false;
-    if (isStreamingResponse(response)) return false; // never consume a real stream
+    if (isStreamingResponse(response)) return false;
 
     try {
-        // clone so the original body is still readable by whoever called fetch()
         const text = await response.clone().text();
         const lower = text.toLowerCase();
         return keywords.some((kw) => lower.includes(kw));
     } catch {
-        return false; // if we can't read it, don't block on it
+        return false;
     }
 }
 
@@ -126,11 +153,17 @@ function installFetchPatch() {
             return originalFetch(input, init);
         }
 
+        const externalSignal = init && init.signal ? init.signal : null;
         const retryableStatuses = getRetryableStatusSet(settings);
         const keywords = getKeywordList(settings);
         let attempt = 0;
 
         while (true) {
+            // If the caller already aborted before we even tried, bail immediately.
+            if (externalSignal && externalSignal.aborted) {
+                throw new DOMException('Aborted', 'AbortError');
+            }
+
             let response;
             let networkError = null;
 
@@ -138,6 +171,14 @@ function installFetchPatch() {
                 response = await originalFetch(input, init);
             } catch (err) {
                 networkError = err;
+            }
+
+            // User hit Stop (or something else aborted the request on purpose):
+            // never retry, propagate immediately so generation actually stops.
+            if (isAbortError(networkError) || (externalSignal && externalSignal.aborted)) {
+                clearToast();
+                if (networkError) throw networkError;
+                throw new DOMException('Aborted', 'AbortError');
             }
 
             let matchedKeyword = false;
@@ -150,6 +191,7 @@ function installFetchPatch() {
             const shouldRetryBody = response && matchedKeyword;
 
             if (!shouldRetryNetworkError && !shouldRetryStatus && !shouldRetryBody) {
+                clearToast();
                 if (networkError) throw networkError;
                 return response;
             }
@@ -178,11 +220,17 @@ function installFetchPatch() {
             log(`Failed (${reason}). Retry ${attempt}/${settings.maxRetries} in ${Math.round(delay)}ms.`);
             toast(`Request failed (${reason}). Retrying in ${Math.round(delay / 1000)}s… (${attempt}/${settings.maxRetries})`, 'warning');
 
-            await sleep(delay);
+            try {
+                await sleep(delay, externalSignal);
+            } catch (err) {
+                // Aborted while we were waiting to retry — respect it, don't fire again.
+                clearToast();
+                throw err;
+            }
         }
     };
 
-    log('fetch() patched — retries on network errors, configured HTTP statuses, and body-keyword matches.');
+    log('fetch() patched — retries on network errors, configured HTTP statuses, and body-keyword matches. Aborts (Stop button) are always respected.');
 }
 
 function uninstallFetchPatch() {
@@ -249,8 +297,9 @@ function renderSettingsUI() {
                     Add jitter to backoff
                 </label>
 
-                <small>Body-keyword scanning is skipped for streaming (SSE) responses so it never
-                interferes with an in-progress generation — it only inspects plain JSON error bodies.</small>
+                <small>Hitting SillyTavern's Stop button always cancels retries immediately —
+                this extension never fights the abort signal. Notifications now update a single
+                toast instead of stacking one per retry attempt.</small>
             </div>
         </div>
     </div>`;
@@ -304,4 +353,4 @@ jQuery(async () => {
     installFetchPatch();
     renderSettingsUI();
 });
-              
+            
