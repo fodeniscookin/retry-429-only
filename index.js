@@ -17,6 +17,10 @@ import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
 const MAX_LOG_ENTRIES = 500;
+// Bump this on every release. Shown in the settings panel and logged on load
+// so you can confirm at a glance whether SillyTavern is running the LATEST
+// code or a stale cached copy (this is the #1 cause of "the fix didn't work").
+const EXT_VERSION = '1.1.2';
 
 const defaultSettings = {
     enabled: true,
@@ -657,6 +661,24 @@ function safeRenderDashboardLogs() {
     }
 }
 
+// Fires the instant a tap/click on the dashboard trigger is *received*,
+// independent of whether opening the panel itself later succeeds. On mobile
+// you can't easily open devtools, so this tiny on-screen ping is the only
+// way to tell "my tap did nothing at all" (stale cached script — the real
+// click handler never even ran) apart from "my tap worked but the panel
+// failed to render" (an actual bug — see the try/catch below).
+let __lastTapPing = 0;
+function notifyTapReceived() {
+    const now = Date.now();
+    if (now - __lastTapPing < 300) return; // de-dupe capture+bubble double-fire
+    __lastTapPing = now;
+    try {
+        if (typeof toastr !== 'undefined') {
+            toastr.info('Tap received (v' + EXT_VERSION + ') — opening…', 'Retry On Error', { timeOut: 1500 });
+        }
+    } catch { /* ignore */ }
+}
+
 function openDashboard() {
     try {
         log('openDashboard() called');
@@ -781,6 +803,7 @@ function addNavButton() {
             e.preventDefault();
             e.stopPropagation();
             log('Dashboard trigger clicked (capture):', target.id);
+            notifyTapReceived();
             const menu = document.getElementById('extensionsMenu');
             if (menu) menu.style.display = 'none';
             openDashboard();
@@ -798,6 +821,7 @@ function addNavButton() {
         e.preventDefault();
         e.stopPropagation();
         log('Dashboard button clicked:', this.id);
+        notifyTapReceived();
         // Close the wand menu / options popup if it is open.
         $('#extensionsMenu').hide();
         $('#options').hide();
@@ -822,7 +846,7 @@ function renderSettingsUI() {
     <div class="retry-on-error-settings">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Retry On Error</b>
+                <b>Retry On Error <span style="opacity:0.55;font-weight:normal;font-size:0.8em;">v${EXT_VERSION}</span></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -972,4 +996,8 @@ jQuery(async () => {
     }, 4000);
 
     log('Initialized. Logs array has', getSettings().logs.length, 'entries.');
+    console.log(
+        '%c[Retry On Error] v' + EXT_VERSION + ' loaded at ' + new Date().toLocaleTimeString(),
+        'background:#222;color:#7CFC00;font-weight:bold;padding:2px 6px;border-radius:3px;',
+    );
 });
