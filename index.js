@@ -20,7 +20,7 @@ const MAX_LOG_ENTRIES = 500;
 // Bump this on every release. Shown in the settings panel and logged on load
 // so you can confirm at a glance whether SillyTavern is running the LATEST
 // code or a stale cached copy (this is the #1 cause of "the fix didn't work").
-const EXT_VERSION = '1.1.2';
+const EXT_VERSION = '1.1.3';
 
 const defaultSettings = {
     enabled: true,
@@ -506,19 +506,9 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function renderDashboardLogs() {
-    renderDashboardStats();
-    const logs = getFilteredLogs();
-
-    if (logs.length === 0) {
-        $('#retry_dashboard_log_list').html(
-            '<div class="retry-log-empty">No log entries yet. Retries will appear here when they occur.</div>',
-        );
-        return;
-    }
-
-    const html = logs
-        .map((entry, index) => {
+// Shared per-entry renderer — used by both the in-page dashboard panel and
+// the standalone new-tab dashboard document, so they can never drift apart.
+function renderLogEntryHtml(entry, index) {
             const typeClass = entry.type === 'success' ? 'success' : 'fail';
             const iconClass =
                 entry.type === 'success'
@@ -604,10 +594,159 @@ function renderDashboardLogs() {
                     ${attemptsHtml}
                 </div>
             </div>`;
-        })
-        .join('');
+}
+
+function renderDashboardLogs() {
+    renderDashboardStats();
+    const logs = getFilteredLogs();
+
+    if (logs.length === 0) {
+        $('#retry_dashboard_log_list').html(
+            '<div class="retry-log-empty">No log entries yet. Retries will appear here when they occur.</div>',
+        );
+        return;
+    }
+
+    const html = logs.map((entry, index) => renderLogEntryHtml(entry, index)).join('');
 
     $('#retry_dashboard_log_list').html(html);
+}
+
+// ─── Standalone New-Tab Dashboard ──────────────────────────────────
+//
+// The in-page overlay panel (below) depends on the host page's CSS cascade,
+// stacking contexts, and viewport units behaving exactly as expected. On at
+// least one real device that assumption broke somewhere — the click handler
+// fired correctly (confirmed via the "Tap received" toast) but the overlay
+// itself never became visible, with no error thrown. Rather than keep
+// guessing at which CSS rule/theme/webview quirk is responsible, the primary
+// path now opens the dashboard as a fully self-contained document in a NEW
+// TAB via a Blob URL — zero dependency on the host page's styles, z-index,
+// or layout, so it can't be silently swallowed by a page-specific CSS rule.
+// The old in-page overlay is kept only as an automatic fallback for the rare
+// case a browser blocks the popup.
+
+function buildStandaloneDashboardDocument() {
+    const settings = getSettings();
+    const logs = settings.logs;
+    const successes = logs.filter((e) => e.type === 'success').length;
+    const failures = logs.filter((e) => e.type === 'fail').length;
+    const totalRetries = logs.reduce((sum, e) => sum + (e.retries || 0), 0);
+
+    const logsHtml =
+        logs.length === 0
+            ? '<div class="retry-log-empty">No log entries yet. Retries will appear here when they occur.</div>'
+            : logs.map((entry, index) => renderLogEntryHtml(entry, index)).join('');
+
+    // Pull in the same look as the in-page panel (see style.css) but scoped to
+    // the standalone document's own <body> instead of #retry-dashboard-panel,
+    // and with filtering/expand-collapse handled by a small inline vanilla-JS
+    // script (no jQuery, no dependency on the extension's live JS at all —
+    // this document works completely on its own once opened).
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retry On Error — Dashboard (v${EXT_VERSION})</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#1a1a1a; color:#e0e0e0; font-family:'Segoe UI',sans-serif; }
+  .retry-dashboard-inner { max-width:1100px; margin:30px auto; padding:20px; }
+  .retry-dashboard-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; padding-bottom:12px; border-bottom:1px solid #333; }
+  .retry-dashboard-title { font-size:1.4em; font-weight:bold; }
+  .retry-dashboard-stats { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .retry-stat-card { background:rgba(0,0,0,0.3); border:1px solid #444; border-radius:8px; padding:10px 18px; min-width:100px; text-align:center; }
+  .retry-stat-value { font-size:1.6em; font-weight:bold; display:block; }
+  .retry-stat-label { font-size:0.75em; opacity:0.7; text-transform:uppercase; letter-spacing:0.5px; }
+  .retry-stat-card.success .retry-stat-value { color:#4caf50; }
+  .retry-stat-card.fail .retry-stat-value { color:#f44336; }
+  .retry-stat-card.retries .retry-stat-value { color:#ff9800; }
+  .retry-dashboard-filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .retry-filter-btn { background:rgba(0,0,0,0.3); border:1px solid #555; border-radius:6px; padding:4px 12px; color:#e0e0e0; cursor:pointer; font-size:0.85em; }
+  .retry-filter-btn.active { background:rgba(255,255,255,0.15); border-color:#e0e0e0; }
+  .retry-log-list { display:flex; flex-direction:column; gap:6px; }
+  .retry-log-entry { background:rgba(0,0,0,0.3); border:1px solid #444; border-radius:8px; overflow:hidden; }
+  .retry-log-entry.success { border-left:3px solid #4caf50; }
+  .retry-log-entry.fail { border-left:3px solid #f44336; }
+  .retry-log-summary { display:flex; align-items:center; gap:10px; padding:10px 14px; cursor:pointer; user-select:none; }
+  .retry-log-status-icon { font-size:1.1em; width:20px; text-align:center; }
+  .retry-log-status-icon.success { color:#4caf50; }
+  .retry-log-status-icon.fail { color:#f44336; }
+  .retry-log-url { flex:1; font-size:0.85em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:0.85; }
+  .retry-log-time { font-size:0.75em; opacity:0.5; white-space:nowrap; }
+  .retry-log-badge { font-size:0.7em; padding:2px 8px; border-radius:4px; background:rgba(255,255,255,0.1); white-space:nowrap; }
+  .retry-log-detail { display:none; padding:0 14px 14px 44px; border-top:1px solid #333; }
+  .retry-log-entry.expanded .retry-log-detail { display:block; }
+  .retry-log-detail-row { display:flex; gap:8px; padding:4px 0; font-size:0.82em; border-bottom:1px solid rgba(255,255,255,0.05); }
+  .retry-log-detail-label { min-width:130px; opacity:0.5; font-weight:bold; }
+  .retry-log-detail-value { flex:1; word-break:break-all; }
+  .retry-log-detail-value.mono { font-family:'Courier New',monospace; font-size:0.9em; }
+  .retry-log-empty { text-align:center; padding:40px; opacity:0.4; font-size:1.1em; }
+  .retry-log-attempts { margin-top:8px; padding:8px; background:rgba(0,0,0,0.2); border-radius:6px; border:1px solid #333; }
+  .retry-log-attempt { display:flex; gap:8px; padding:3px 0; font-size:0.8em; border-bottom:1px solid rgba(255,255,255,0.03); }
+  .retry-log-attempt-num { min-width:60px; opacity:0.5; }
+  .retry-log-attempt-delay { min-width:80px; color:#ff9800; }
+  .retry-log-entry[data-hidden-by-filter="true"] { display:none; }
+</style>
+</head>
+<body>
+<div class="retry-dashboard-inner">
+    <div class="retry-dashboard-header">
+        <div class="retry-dashboard-title"><i class="fa-solid fa-rotate-right"></i> Retry On Error — Dashboard <span style="opacity:0.5;font-size:0.7em;">v${EXT_VERSION}</span></div>
+    </div>
+    <div class="retry-dashboard-stats">
+        <div class="retry-stat-card success"><span class="retry-stat-value">${successes}</span><span class="retry-stat-label">Succeeded</span></div>
+        <div class="retry-stat-card fail"><span class="retry-stat-value">${failures}</span><span class="retry-stat-label">Failed</span></div>
+        <div class="retry-stat-card retries"><span class="retry-stat-value">${totalRetries}</span><span class="retry-stat-label">Total Retries</span></div>
+        <div class="retry-stat-card"><span class="retry-stat-value">${logs.length}</span><span class="retry-stat-label">Total Events</span></div>
+    </div>
+    <div class="retry-dashboard-filters">
+        <button class="retry-filter-btn active" data-filter="all">All</button>
+        <button class="retry-filter-btn" data-filter="success">Successes</button>
+        <button class="retry-filter-btn" data-filter="fail">Failures</button>
+        <span style="opacity:0.5;font-size:0.8em;margin-left:auto;">Snapshot from ${escapeHtml(new Date().toLocaleString())} — reopen from Settings to refresh</span>
+    </div>
+    <div class="retry-log-list" id="retry_dashboard_log_list">
+        ${logsHtml}
+    </div>
+</div>
+<script>
+document.addEventListener('click', function (e) {
+    var summary = e.target.closest('.retry-log-summary');
+    if (summary) {
+        summary.closest('.retry-log-entry').classList.toggle('expanded');
+        return;
+    }
+    var filterBtn = e.target.closest('.retry-filter-btn');
+    if (filterBtn) {
+        document.querySelectorAll('.retry-filter-btn').forEach(function (b) { b.classList.remove('active'); });
+        filterBtn.classList.add('active');
+        var filter = filterBtn.getAttribute('data-filter');
+        document.querySelectorAll('.retry-log-entry').forEach(function (entry) {
+            var show = filter === 'all' || entry.classList.contains(filter);
+            entry.setAttribute('data-hidden-by-filter', show ? 'false' : 'true');
+        });
+    }
+});
+</script>
+</body>
+</html>`;
+}
+
+function openStandaloneDashboard() {
+    const html = buildStandaloneDashboardDocument();
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const win = window.open(url, '_blank');
+    if (!win) {
+        URL.revokeObjectURL(url);
+        return false;
+    }
+    // Give the new tab plenty of time to finish loading before revoking.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return true;
 }
 
 // Toggle expand for a log entry (delegated — CSP-safe, no inline onclick)
@@ -679,9 +818,9 @@ function notifyTapReceived() {
     } catch { /* ignore */ }
 }
 
-function openDashboard() {
+function openDashboardInPage() {
     try {
-        log('openDashboard() called');
+        log('openDashboardInPage() called');
         const panel = ensureDashboardPanel();
         if (!panel) throw new Error('panel could not be created');
 
@@ -700,10 +839,10 @@ function openDashboard() {
         safeRenderDashboardLogs();
 
         const rect = panel.getBoundingClientRect();
-        log('Dashboard opened. size=', Math.round(rect.width) + 'x' + Math.round(rect.height),
-            'computedDisplay=', getComputedStyle(panel).display);
+        log('Dashboard opened in-page. size=', Math.round(rect.width) + 'x' + Math.round(rect.height));
+        return true;
     } catch (err) {
-        console.error('[Retry On Error] openDashboard failed:', err);
+        console.error('[Retry On Error] openDashboardInPage failed:', err);
         try {
             if (typeof toastr !== 'undefined') {
                 toastr.error(String(err && err.message ? err.message : err), 'Retry Dashboard failed to open');
@@ -711,7 +850,44 @@ function openDashboard() {
                 alert('Retry Dashboard failed to open: ' + err);
             }
         } catch { /* ignore */ }
+        return false;
     }
+}
+
+function openDashboard() {
+    log('openDashboard() called');
+    // Primary path: a fully standalone document in a new tab, immune to any
+    // host-page CSS/theme/webview quirk. Must run synchronously off the
+    // original user gesture or popup blockers will kill it.
+    let openedInNewTab = false;
+    try {
+        openedInNewTab = openStandaloneDashboard();
+    } catch (err) {
+        console.error('[Retry On Error] openStandaloneDashboard failed:', err);
+        openedInNewTab = false;
+    }
+
+    if (openedInNewTab) {
+        try {
+            if (typeof toastr !== 'undefined') {
+                toastr.success('Opened in a new tab.', 'Retry Dashboard');
+            }
+        } catch { /* ignore */ }
+        return;
+    }
+
+    // Fallback: popup was blocked (or something else went wrong) — use the
+    // old in-page overlay panel instead.
+    log('New-tab dashboard unavailable, falling back to in-page panel.');
+    try {
+        if (typeof toastr !== 'undefined') {
+            toastr.warning(
+                'Your browser blocked the popup — showing the dashboard in-page instead. Allow popups for this site to get the new-tab view next time.',
+                'Retry Dashboard',
+            );
+        }
+    } catch { /* ignore */ }
+    openDashboardInPage();
 }
 
 function closeDashboard() {
