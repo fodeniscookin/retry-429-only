@@ -42,3 +42,21 @@ nothing still "in flight" to collide with.
 If short responses are a real issue separately, that's better solved via
 `max_tokens` / response length settings on the model side, not an
 auto-retry.
+
+
+## v1.2.0 — bug fixes
+
+- **Fixed streaming breakage.** v1.1.3's body-keyword scan awaited
+  `response.clone().text()` on any response whose content-type wasn't exactly
+  `text/event-stream` — which buffered the ENTIRE generation before SillyTavern
+  ever saw the response, turning streaming into a single whole-block dump.
+  The scan now runs only on JSON bodies (complete by definition) and never
+  buffers anything that might be a stream.
+- **Fixed mystery "max retries" failures.** Two causes: (a) the patch applied
+  retry logic + failure toasts to EVERY fetch SillyTavern makes, so random
+  background 500s surfaced as retry-exhausted toasts; retry logic is now
+  scoped to chat-generation URLs only (configurable). (b) `Request` objects
+  had their body consumed by the first attempt, so every retry sent an empty
+  body and got rejected — retries now replay from a pristine clone.
+- **Fixed "0 successes" in the dashboard.** Only success-after-retry was ever
+  logged; first-try successes are now logged too (toggleable).

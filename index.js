@@ -20,7 +20,7 @@ const MAX_LOG_ENTRIES = 500;
 // Bump this on every release. Shown in the settings panel and logged on load
 // so you can confirm at a glance whether SillyTavern is running the LATEST
 // code or a stale cached copy (this is the #1 cause of "the fix didn't work").
-const EXT_VERSION = '1.1.3';
+const EXT_VERSION = '1.2.0';
 
 const defaultSettings = {
     enabled: true,
@@ -33,7 +33,16 @@ const defaultSettings = {
     retryableStatuses: '429,500,502,503,504',
     retryOnBodyKeywords: true,
     bodyKeywords: 'temporarily unavailable,rate limit,rate-limited,overloaded',
-    logs: [],
+    // Only requests whose URL matches one of these patterns get retry logic,
+    // logging, and failure toasts. Everything else (settings saves, thumbnails,
+    // title generation, background polls) passes through untouched, so a random
+    // background 500 no longer produces a "max retries" toast out of nowhere.
+    applyUrlPatterns: '/api/backends/,/chat/completions,/v1/completions,/completions',
+    // Log successful requests on the FIRST try too (previously only
+    // success-after-retry was logged, so the dashboard showed 0 successes
+    // even when everything was working).
+    logFirstTrySuccesses: true,
+    logs: []
     maxLogEntries: MAX_LOG_ENTRIES,
 };
 
@@ -154,9 +163,23 @@ function isStreamingResponse(response) {
     return contentType.includes('text/event-stream');
 }
 
+// STREAMING-SAFE body scan.
+//
+// v1.1.3 bug: this function awaited response.clone().text() on ANY response
+// whose content-type wasn't exactly 'text/event-stream'. For streams that
+// declare a different (or missing) content-type, that blocked the response
+// until the ENTIRE generation had been downloaded — SillyTavern only received
+// the body after it was fully buffered, which turned streaming into a single
+// whole-block dump. This was the "extension breaks streaming" bug.
+//
+// Fix: only ever scan bodies that are declared JSON. A JSON response is a
+// complete, non-streaming body by definition, so buffering it is free.
+// Everything else (SSE, octet-stream, missing content-type, anything
+// undelcared) is treated as a stream and NEVER buffered.
 async function bodyMatchesKeyword(response, keywords) {
     if (keywords.length === 0) return false;
-    if (isStreamingResponse(response)) return false;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().includes('json')) return false;
 
     try {
         const text = await response.clone().text();
@@ -179,6 +202,22 @@ const INTERNAL_URL_PATTERNS = [
 
 function isInternalRequest(url) {
     return INTERNAL_URL_PATTERNS.some((p) => url.includes(p));
+}
+
+// URL patterns (comma-separated) that mark a request as "retry-worthy".
+// Retry logic, logging, and toasts only apply to matching URLs — chat
+// generation endpoints by default. Non-matching traffic passes through
+// completely untouched.
+function getApplyPatterns(settings) {
+    return settings.applyUrlPatterns
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+function isGenerationRequest(url, settings) {
+    if (settings.applyUrlPatterns === '') return true; // empty = apply everywhere
+    return getApplyPatterns(settings).some((p) => url.includes(p));
 }
 
 // A request whose body is a stream (or a consumed Request object) cannot be
@@ -218,6 +257,27 @@ function installFetchPatch() {
             return originalFetch(input, init);
         }
 
+        // Only generation-style requests get retry behavior. Background
+        // SillyTavern traffic (settings saves, thumbnails, polls, etc.) passes
+        // through untouched — no retries, no toasts, no log spam.
+        if (!isGenerationRequest(requestUrl, settings)) {
+            return originalFetch(input, init);
+        }
+
+        // Request-body replay fix (v1.1.3 bug): fetch() consumes a Request
+        // object's body. On the second attempt, re-fetching the same Request
+        // sent an EMPTY body, which the server rejected — producing mystery
+        // 429/400/500 loops that exhausted retries "on no specific occasion".
+        // Keep a pristine template and hand each attempt a fresh clone.
+        const requestTemplate = typeof Request !== 'undefined' && input instanceof Request ? input.clone() : null;
+
+        function fetchAttempt() {
+            if (requestTemplate) {
+                return originalFetch(requestTemplate.clone(), init);
+            }
+            return originalFetch(input, init);
+        }
+
         const externalSignal = init && init.signal ? init.signal : null;
         const retryableStatuses = getRetryableStatusSet(settings);
         const keywords = getKeywordList(settings);
@@ -235,7 +295,7 @@ function installFetchPatch() {
             let networkError = null;
 
             try {
-                response = await originalFetch(input, init);
+                response = await fetchAttempt();
             } catch (err) {
                 networkError = err;
             }
@@ -255,10 +315,14 @@ function installFetchPatch() {
             const shouldRetryBody = response && matchedKeyword;
 
             if (!shouldRetryNetworkError && !shouldRetryStatus && !shouldRetryBody) {
-                // Success — but was it retried?
-                if (attempt > 0) {
-                    const reason = 'succeeded after ' + attempt + ' retries';
-                    log(`Success after ${attempt} retries.`);
+                // Success. v1.1.3 bug: only success-AFTER-retry was logged, so
+                // the dashboard showed "0 succeeded" forever when requests
+                // simply worked on the first try. First-try successes are now
+                // logged too (toggle in settings).
+                const shouldLog = attempt > 0 || settings.logFirstTrySuccesses;
+                if (shouldLog) {
+                    const reason = attempt > 0 ? 'succeeded after ' + attempt + ' retries' : 'ok on first try';
+                    log(`Success (${reason}).`);
                     attemptHistory.push({
                         attempt: attempt,
                         result: 'success',
@@ -1071,6 +1135,18 @@ function renderSettingsUI() {
                     Add jitter to backoff
                 </label>
 
+                <label>Apply retries ONLY to URLs containing (comma-separated)
+                    <input id="retryerr_applyUrlPatterns" class="text_pole" type="text" value="${settings.applyUrlPatterns}">
+                </label>
+                <small>Only these requests get retry logic, logging and failure
+                toasts (chat generation endpoints by default). Everything else passes
+                through untouched. Leave empty to retry ALL requests.</small>
+
+                <label class="checkbox_label">
+                    <input id="retryerr_logFirstTrySuccesses" type="checkbox" ${settings.logFirstTrySuccesses ? 'checked' : ''}>
+                    Log first-try successes too (otherwise only successes after retries are logged)
+                </label>
+
                 <hr>
                 <div class="marginBot10">
                     <div class="menu_button menu_button_icon" id="retry_dashboard_open_btn" style="width:100%;text-align:center;cursor:pointer;">
@@ -1125,6 +1201,14 @@ function renderSettingsUI() {
     });
     $('#retryerr_bodyKeywords').on('input', function () {
         getSettings().bodyKeywords = $(this).val();
+        saveSettingsDebounced();
+    });
+    $('#retryerr_applyUrlPatterns').on('input', function () {
+        getSettings().applyUrlPatterns = $(this).val();
+        saveSettingsDebounced();
+    });
+    $('#retryerr_logFirstTrySuccesses').on('change', function () {
+        getSettings().logFirstTrySuccesses = $(this).prop('checked');
         saveSettingsDebounced();
     });
     $('#retryerr_respectRetryAfter').on('change', function () {
