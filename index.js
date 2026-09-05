@@ -12,17 +12,19 @@
 // If the caller passed an AbortSignal (SillyTavern's "Stop" button does this),
 // an abort is never retried — it's immediately propagated so Stop still stops.
 //
-// NOTE on streaming: to know the word count of a reply we have to read the
-// full response body before deciding whether to retry. For streaming
-// (SSE) responses this means the reply appears all at once instead of
-// token-by-token, but retry behavior works the same for streaming and
-// non-streaming requests.
+// NOTE on streaming: a genuine live SSE stream (request has "stream":true,
+// or the response's content-type is text/event-stream) is never buffered or
+// otherwise touched — real-time token-by-token display is fully preserved.
+// For streaming responses only network errors and non-2xx HTTP status are
+// checked (both are known before any body is read); the "under 40 words"
+// check only applies to non-streaming replies, since checking it would
+// require reading the whole reply before it could be displayed at all.
 
 import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
-const EXT_VERSION = '2.0.0';
+const EXT_VERSION = '2.0.1';
 const MIN_WORDS = 40;
 
 const defaultSettings = {
@@ -70,6 +72,12 @@ function isReplayable(input, init) {
     return true;
 }
 
+function isStreamingRequest(init) {
+    const body = init && init.body;
+    if (typeof body !== 'string') return false;
+    return /"stream"\s*:\s*true/i.test(body);
+}
+
 function extractUrl(input) {
     if (typeof input === 'string') return input;
     if (input && input.url) return input.url;
@@ -112,18 +120,23 @@ function extractReplyText(bodyText, contentType) {
 
     if (looksLikeSse) {
         let combined = '';
+        let anyTextFound = false;
         for (const line of trimmed.split(/\r?\n/)) {
             const m = line.match(/^data:\s*(.*)$/);
             if (!m) continue;
             const payload = m[1].trim();
             if (!payload || payload === '[DONE]') continue;
             try {
-                combined += extractTextFromObject(JSON.parse(payload));
+                const piece = extractTextFromObject(JSON.parse(payload));
+                if (piece !== null) {
+                    combined += piece;
+                    anyTextFound = true;
+                }
             } catch {
                 // ignore malformed/partial chunk
             }
         }
-        return combined;
+        return anyTextFound ? combined : null;
     }
 
     try {
@@ -133,12 +146,22 @@ function extractReplyText(bodyText, contentType) {
     }
 }
 
+// Returns the reply text if we can positively identify it, or null if the
+// shape is unrecognized OR it's a structured tool/function call with no text
+// (a tool call isn't "a short reply" — treating it as 0 words would trigger
+// pointless retries on perfectly valid responses).
 function extractTextFromObject(obj) {
-    if (!obj || typeof obj !== 'object') return '';
+    if (!obj || typeof obj !== 'object') return null;
     const choice = Array.isArray(obj.choices) ? obj.choices[0] : null;
     if (choice) {
-        if (choice.delta && typeof choice.delta.content === 'string') return choice.delta.content;
-        if (choice.message && typeof choice.message.content === 'string') return choice.message.content;
+        if (choice.delta) {
+            if (typeof choice.delta.content === 'string') return choice.delta.content;
+            if (choice.delta.tool_calls || choice.delta.function_call) return null;
+        }
+        if (choice.message) {
+            if (typeof choice.message.content === 'string') return choice.message.content;
+            if (choice.message.tool_calls || choice.message.function_call) return null;
+        }
         if (typeof choice.text === 'string') return choice.text;
     }
     if (Array.isArray(obj.results) && obj.results[0] && typeof obj.results[0].text === 'string') {
@@ -146,7 +169,7 @@ function extractTextFromObject(obj) {
     }
     if (typeof obj.content === 'string') return obj.content;
     if (typeof obj.text === 'string') return obj.text;
-    return '';
+    return null; // unrecognized shape — don't guess, skip the word-count check
 }
 
 function countWords(text) {
@@ -195,16 +218,29 @@ function installFetchPatch() {
 
             let finalResponse = response;
             let wordCount = null;
-            let extractFailed = false;
 
-            if (!networkError) {
-                // Buffer the body once so we can (a) count words and (b) still
-                // hand the caller a fresh, fully-readable Response either way.
+            // A genuine live stream must NEVER be buffered here — reading it
+            // fully before returning would turn real-time token-by-token
+            // streaming into a multi-second freeze-then-dump-everything-at-once.
+            // We detect "this is a real stream" from the OUTGOING request (the
+            // caller asked for stream:true) OR the response's own content-type,
+            // and if so we skip body inspection entirely: only HTTP status and
+            // network errors are checked (both available without touching the
+            // body), and the original, untouched, still-lazy response is what
+            // gets returned/streamed onward.
+            const looksStreaming =
+                !networkError &&
+                (isStreamingRequest(init) || (response.headers.get('content-type') || '').includes('event-stream'));
+
+            if (!networkError && !looksStreaming) {
+                // Non-streaming reply: safe to buffer once so we can (a) count
+                // words and (b) still hand the caller a fresh, fully-readable
+                // Response either way.
                 let bodyText = null;
                 try {
                     bodyText = await response.clone().text();
                 } catch {
-                    extractFailed = true;
+                    bodyText = null;
                 }
 
                 if (bodyText !== null) {
@@ -256,7 +292,6 @@ function installFetchPatch() {
 
             attempt += 1;
             await sleep(settings.delayMs, externalSignal);
-            void extractFailed; // kept for readability; body-parse failures just skip the word-count check
         }
     };
 
