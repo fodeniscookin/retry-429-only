@@ -20,7 +20,7 @@ const MAX_LOG_ENTRIES = 500;
 // Bump this on every release. Shown in the settings panel and logged on load
 // so you can confirm at a glance whether SillyTavern is running the LATEST
 // code or a stale cached copy (this is the #1 cause of "the fix didn't work").
-const EXT_VERSION = '1.2.0';
+const EXT_VERSION = '1.2.1';
 
 const defaultSettings = {
     enabled: true,
@@ -1079,10 +1079,10 @@ function addNavButton() {
 
 // ─── Settings UI ───────────────────────────────────────────────────
 
-function renderSettingsUI() {
+function buildSettingsHtml() {
     const settings = getSettings();
 
-    const html = `
+    return `
     <div class="retry-on-error-settings">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
@@ -1167,8 +1167,19 @@ function renderSettingsUI() {
             </div>
         </div>
     </div>`;
+}
 
-    $('#extensions_settings2').append(html);
+// v1.2.1 fix: the previous version called $('#extensions_settings2').append(html)
+// exactly once at startup with no existence check and no retry. Elsewhere in this
+// same file (see addNavButton) the container the extension needs to attach to is
+// treated as possibly not existing yet at init time and retried aggressively —
+// this settings panel had NONE of that protection. If SillyTavern's extensions
+// panel DOM wasn't built yet the moment this ran (slow load, mobile, panel built
+// lazily on first open), the append matched zero elements and silently did
+// nothing forever: no error, no retry, no settings drawer, no gear icon, no way
+// to reach the toggles. This is almost certainly why the drawer was invisible.
+function wireSettingsInputs() {
+    const settings = getSettings();
 
     // Wire up settings inputs
     $('#retryerr_enabled').on('change', function () {
@@ -1226,7 +1237,51 @@ function renderSettingsUI() {
 
     // Dashboard open button handler is delegated in addNavButton() —
     // no direct binding needed here.
+
+let settingsInjected = false;
+
+function injectSettingsUI() {
+    if (settingsInjected) return true;
+    // Prefer the standard third-party extension container; fall back to the
+    // primary one if a theme/version doesn't have extensions_settings2.
+    let container = $('#extensions_settings2');
+    if (container.length === 0) container = $('#extensions_settings');
+    if (container.length === 0) return false;
+
+    container.append(buildSettingsHtml());
+    wireSettingsInputs();
+    settingsInjected = true;
+    log('Settings UI injected into ' + (container.attr('id') || '(unknown container)') + '.');
+    return true;
 }
+
+function ensureSettingsUIInjected() {
+    if (injectSettingsUI()) return;
+
+    // Container wasn't there yet — retry on a timer AND watch the DOM directly.
+    // A MutationObserver means we don't just give up after N attempts: if the
+    // panel is only built the first time the user opens the Extensions flyout,
+    // we still catch it whenever that happens, with no arbitrary timeout.
+    let attempts = 0;
+    const maxAttempts = 40; // ~20s of polling as a fast path
+    const poll = setInterval(() => {
+        attempts += 1;
+        if (injectSettingsUI() || attempts >= maxAttempts) {
+            clearInterval(poll);
+        }
+    }, 500);
+
+    if (typeof MutationObserver !== 'undefined') {
+        const observer = new MutationObserver(() => {
+            if (injectSettingsUI()) {
+                observer.disconnect();
+                clearInterval(poll);
+            }
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
+}
+
 
 // ─── Init ──────────────────────────────────────────────────────────
 
@@ -1244,7 +1299,7 @@ jQuery(async () => {
     safely('installFetchPatch', installFetchPatch);
     // Settings UI must never be able to take the nav/dashboard buttons down
     // with it — each step is isolated.
-    safely('renderSettingsUI', renderSettingsUI);
+    safely('ensureSettingsUIInjected', ensureSettingsUIInjected);
     safely('addNavButton', addNavButton);
 
     // Safety net: if anything above raced with SillyTavern's own DOM setup,

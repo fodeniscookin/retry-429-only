@@ -60,3 +60,16 @@ auto-retry.
   body and got rejected — retries now replay from a pristine clone.
 - **Fixed "0 successes" in the dashboard.** Only success-after-retry was ever
   logged; first-try successes are now logged too (toggleable).
+
+
+## v1.2.1 — settings panel visibility fix
+
+- **Fixed the settings drawer sometimes never appearing at all** (no gear
+  icon, no entry in the Extensions flyout). The previous code injected the
+  settings UI exactly once, synchronously, at startup, with no check that
+  SillyTavern's extensions panel container already existed in the DOM and no
+  retry if it didn't — on some devices/load orders the container isn't built
+  yet at that point, so the injection silently landed on an empty selector
+  and nothing ever showed up. Injection is now retried on a timer and backed
+  by a MutationObserver, matching the retry pattern already used elsewhere in
+  this extension for its dashboard button.
