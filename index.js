@@ -20,7 +20,7 @@ const MAX_LOG_ENTRIES = 500;
 // Bump this on every release. Shown in the settings panel and logged on load
 // so you can confirm at a glance whether SillyTavern is running the LATEST
 // code or a stale cached copy (this is the #1 cause of "the fix didn't work").
-const EXT_VERSION = '1.2.1';
+const EXT_VERSION = '1.2.2';
 
 const defaultSettings = {
     enabled: true,
@@ -42,7 +42,7 @@ const defaultSettings = {
     // success-after-retry was logged, so the dashboard showed 0 successes
     // even when everything was working).
     logFirstTrySuccesses: true,
-    logs: []
+    logs: [],
     maxLogEntries: MAX_LOG_ENTRIES,
 };
 

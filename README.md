@@ -73,3 +73,11 @@ auto-retry.
   and nothing ever showed up. Injection is now retried on a timer and backed
   by a MutationObserver, matching the retry pattern already used elsewhere in
   this extension for its dashboard button.
+
+
+## v1.2.2 — load fix
+
+- Fixed a missing comma in the default settings object that caused a JavaScript
+  syntax error and prevented SillyTavern from loading the extension at all.
+- Bumped the manifest version to make the repaired release easy to identify when
+  troubleshooting cached extension files.
