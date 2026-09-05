@@ -81,3 +81,8 @@ auto-retry.
   syntax error and prevented SillyTavern from loading the extension at all.
 - Bumped the manifest version to make the repaired release easy to identify when
   troubleshooting cached extension files.
+
+
+## v1.2.3 — initialization fix
+
+- Fixed a missing closing brace that accidentally nested startup and settings injection inside the input-wiring function, leaving the extension installed but inactive.
