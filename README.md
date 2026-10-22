@@ -52,6 +52,21 @@ just enable/disable, max retries, and delay between retries.
 
 ## Changelog
 
+### v2.3.0 — custom error phrases
+
+- New **Custom error phrases** box in settings: one entry per line, and if the
+  reply contains any of them the request is retried, **even when the reply is
+  longer than the minimum word count**.
+  - Plain text is a case-insensitive "contains" match.
+  - `/pattern/flags` is a regular expression (e.g. `/quota|429/i`).
+  - Lines starting with `#` are ignored; an invalid regex is treated as plain text.
+- Works on non-streaming and streaming replies. For streams, the first N
+  characters (**Phrase scan window**, default 300) are scanned before anything
+  is shown, so a refusal at the start of a reply is retried invisibly, and the
+  rest still streams live. A phrase that only shows up *later* in a stream can
+  be caught only with "Hold streams to enforce minimum length" on (it scans the
+  whole reply, at the cost of live display).
+
 ### v2.2.1 — harder error detection on streams
 
 - Streams that fail in non-JSON ways are now retried too: plain-text `data:`

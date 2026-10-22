@@ -25,7 +25,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
-const EXT_VERSION = '2.2.1';
+const EXT_VERSION = '2.3.0';
 
 const defaultSettings = {
     enabled: true,
@@ -34,6 +34,8 @@ const defaultSettings = {
     minWords: 40,
     inspectStreams: true,
     holdStreamsForMinWords: false,
+    customErrors: '',
+    scanChars: 300,
     peekMaxMs: 15000,
     debug: false,
 };
@@ -154,6 +156,43 @@ async function makeReplayable(input, init) {
 function requestAsksForStream(bodyText) {
     if (typeof bodyText !== 'string') return false;
     return /"stream"\s*:\s*true/i.test(bodyText);
+}
+
+
+// ─── Custom error phrases ───────────────────────────────────────────
+// One entry per line. Plain text = case-insensitive substring match.
+// `/pattern/flags` = regular expression. Lines starting with `#` are ignored.
+function parseCustomErrors(raw) {
+    const out = [];
+    for (const lineRaw of String(raw || '').split(/\r?\n/)) {
+        const line = lineRaw.trim();
+        if (!line || line.startsWith('#')) continue;
+        const m = line.match(/^\/(.+)\/([gimsuy]*)$/);
+        if (m) {
+            try {
+                out.push({ label: line, test: (t) => new RegExp(m[1], m[2].replace(/g|y/g, '')).test(t) });
+                continue;
+            } catch {
+                // invalid regex: fall through and treat as plain text
+            }
+        }
+        const needle = line.toLowerCase();
+        out.push({ label: line, test: (t) => t.toLowerCase().includes(needle) });
+    }
+    return out;
+}
+
+// Returns the first matching entry label, or null.
+function findCustomErrorMatch(text, raw) {
+    if (!text) return null;
+    for (const entry of parseCustomErrors(raw)) {
+        try {
+            if (entry.test(text)) return entry.label;
+        } catch {
+            // ignore a broken entry
+        }
+    }
+    return null;
 }
 
 function countWords(text) {
@@ -314,7 +353,7 @@ function rebuildResponse(bodyText, response, asStream) {
 //   { verdict: 'error'|'ok'|'ended'|'timeout', error, text, chunks, reader, done }
 // `chunks` are the raw Uint8Arrays read so far (to be replayed), `reader` is
 // the still-open reader (when not done) to be piped through afterwards.
-async function peekStream(response, signal, maxMs) {
+async function peekStream(response, signal, maxMs, peekCfg = { customErrors: '', scanChars: 0 }) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
@@ -325,7 +364,16 @@ async function peekStream(response, signal, maxMs) {
     const verdictFor = (final) => {
         const { error, text } = inspectBodyPartial(seen, response.headers.get('content-type') || '', final);
         if (error) return { verdict: 'error', error, text };
-        if (text !== null && text.trim().length > 0) return { verdict: 'ok', error: null, text };
+        if (text !== null && text.trim().length > 0) {
+            const hit = findCustomErrorMatch(text, peekCfg.customErrors);
+            if (hit) return { verdict: 'error', error: `matched custom error "${hit}"`, text };
+            // Keep reading (still buffered, nothing shown yet) until enough text has been
+            // scanned, so phrases near the start of a reply are caught before display.
+            if (!final && peekCfg.scanChars > 0 && parseCustomErrors(peekCfg.customErrors).length && text.length < peekCfg.scanChars) {
+                return null;
+            }
+            return { verdict: 'ok', error: null, text };
+        }
         // Reasoning / thinking / tool-call deltas prove the upstream is generating
         // normally, so commit and let them stream live instead of waiting for content.
         if (/"(reasoning_content|reasoning|thinking|thought|tool_calls|function_call)"\s*:\s*(\[|\{|"[^"])/i.test(seen) && !error) {
@@ -473,6 +521,7 @@ function installFetchPatch() {
             let finalResponse = response;
             let bodyError = null;
             let wordCount = null;
+            let replyText = null;
 
             if (!networkError) {
                 const contentType = response.headers.get('content-type') || '';
@@ -481,9 +530,9 @@ function installFetchPatch() {
                 if (isStreamResponse && response.ok && settings.inspectStreams && !settings.holdStreamsForMinWords) {
                     // Live stream: peek only until a verdict, then pass through.
                     try {
-                        const peek = await peekStream(response, externalSignal, Math.max(1000, Number(settings.peekMaxMs) || 15000));
+                        const peek = await peekStream(response, externalSignal, Math.max(1000, Number(settings.peekMaxMs) || 15000), { customErrors: settings.customErrors, scanChars: Math.max(0, Number(settings.scanChars) || 0) });
                         bodyError = peek.error;
-                        if (peek.verdict === 'ended' && peek.text !== null) wordCount = countWords(peek.text);
+                        if (peek.verdict === 'ended' && peek.text !== null) { wordCount = countWords(peek.text); replyText = peek.text; }
                         if (peek.verdict === 'error') {
                             try { peek.reader.cancel(); } catch { /* ignore */ }
                         } else {
@@ -507,7 +556,7 @@ function installFetchPatch() {
                     if (bodyText !== null) {
                         const { error, text } = inspectBody(bodyText, contentType);
                         bodyError = error;
-                        if (text !== null) wordCount = countWords(text);
+                        if (text !== null) { wordCount = countWords(text); replyText = text; }
                         finalResponse = rebuildResponse(bodyText, response, isStreamResponse);
                         debugLog('Inspected response:', {
                             status: response.status,
@@ -518,6 +567,10 @@ function installFetchPatch() {
                     }
                 }
             }
+
+            let customHit = null;
+            if (!networkError && replyText !== null) customHit = findCustomErrorMatch(replyText, settings.customErrors);
+            if (customHit && !bodyError) bodyError = `matched custom error "${customHit}"`;
 
             const isHttpError = !networkError && !response.ok;
             const isShortReply = minWords > 0 && wordCount !== null && wordCount < minWords;
@@ -612,6 +665,16 @@ function buildSettingsHtml() {
                     Hold streams to enforce minimum length (buffers the whole reply, so it appears at once instead of live)
                 </label>
 
+                <label>Custom error phrases (one per line, retry if the reply contains any)
+                    <textarea id="retryerr_customErrors" class="text_pole textarea_compact" rows="5" placeholder="I cannot continue with this&#10;as an AI language model&#10;/rate.?limit(ed)?/i">${$('<div>').text(settings.customErrors || '').html()}</textarea>
+                </label>
+                <small>Plain text = case-insensitive match. Wrap in <code>/slashes/</code> for a regex (e.g. <code>/quota|429/i</code>). Lines starting with <code>#</code> are ignored. Applies even when the reply is longer than the minimum word count.</small>
+
+                <label>Phrase scan window for streams (characters)
+                    <input id="retryerr_scanChars" class="text_pole" type="number" min="0" max="5000" step="50" value="${settings.scanChars}">
+                </label>
+                <small>Streams are held back (briefly, nothing shown) until this many characters have been scanned for your phrases, so a refusal at the start of a reply is retried invisibly. Later in the reply it can only be caught if "Hold streams" is on. 0 = off.</small>
+
                 <label class="checkbox_label">
                     <input id="retryerr_debug" type="checkbox" ${settings.debug ? 'checked' : ''}>
                     Debug logging in browser console
@@ -644,6 +707,14 @@ function wireSettingsInputs() {
     });
     $('#retryerr_inspectStreams').on('change', function () {
         getSettings().inspectStreams = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#retryerr_customErrors').on('input', function () {
+        getSettings().customErrors = String($(this).val());
+        saveSettingsDebounced();
+    });
+    $('#retryerr_scanChars').on('input', function () {
+        getSettings().scanChars = Number($(this).val());
         saveSettingsDebounced();
     });
     $('#retryerr_holdStreams').on('change', function () {
