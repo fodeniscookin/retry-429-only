@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "",
     "author": "fodeniscookin",
-    "version": "2.3.0",
+    "version": "2.4.0",
     "homePage": "https://github.com/fodeniscookin/retry-429-only",
     "auto_update": true
 }

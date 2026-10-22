@@ -25,7 +25,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
-const EXT_VERSION = '2.3.0';
+const EXT_VERSION = '2.4.0';
 
 const defaultSettings = {
     enabled: true,
@@ -35,6 +35,7 @@ const defaultSettings = {
     inspectStreams: true,
     holdStreamsForMinWords: false,
     customErrors: '',
+    errorEntries: [],
     scanChars: 300,
     peekMaxMs: 15000,
     debug: false,
@@ -46,10 +47,24 @@ function getSettings() {
     }
     for (const key of Object.keys(defaultSettings)) {
         if (extension_settings[MODULE_NAME][key] === undefined) {
-            extension_settings[MODULE_NAME][key] = defaultSettings[key];
+            extension_settings[MODULE_NAME][key] = structuredClone(defaultSettings[key]);
         }
     }
-    return extension_settings[MODULE_NAME];
+    const st = extension_settings[MODULE_NAME];
+    // Migrate the v2.3 single textarea (one phrase per line) into separate entries.
+    if (st.customErrors && String(st.customErrors).trim()) {
+        for (const lineRaw of String(st.customErrors).split(/\r?\n/)) {
+            const line = lineRaw.trim();
+            if (!line || line.startsWith('#')) continue;
+            const m = line.match(/^\/(.+)\/([gimsuy]*)$/);
+            st.errorEntries.push(m
+                ? { text: m[1], mode: 'regex', flags: m[2].replace(/[gy]/g, '') || 'i', enabled: true }
+                : { text: line, mode: 'text', flags: 'i', enabled: true });
+        }
+        st.customErrors = '';
+    }
+    if (!Array.isArray(st.errorEntries)) st.errorEntries = [];
+    return st;
 }
 
 function log(...args) {
@@ -159,37 +174,78 @@ function requestAsksForStream(bodyText) {
 }
 
 
-// ─── Custom error phrases ───────────────────────────────────────────
-// One entry per line. Plain text = case-insensitive substring match.
-// `/pattern/flags` = regular expression. Lines starting with `#` are ignored.
-function parseCustomErrors(raw) {
+// ─── Custom error entries ───────────────────────────────────────────
+// Each entry: { text, mode: 'text' | 'regex', flags, enabled }.
+// 'text'  = case-insensitive "contains".
+// 'regex' = a regular expression with the given flags.
+function compileEntries(entries) {
     const out = [];
-    for (const lineRaw of String(raw || '').split(/\r?\n/)) {
-        const line = lineRaw.trim();
-        if (!line || line.startsWith('#')) continue;
-        const m = line.match(/^\/(.+)\/([gimsuy]*)$/);
-        if (m) {
+    for (const e of Array.isArray(entries) ? entries : []) {
+        if (!e || e.enabled === false) continue;
+        const text = String(e.text ?? '').trim();
+        if (!text) continue;
+        if (e.mode === 'regex') {
             try {
-                out.push({ label: line, test: (t) => new RegExp(m[1], m[2].replace(/g|y/g, '')).test(t) });
+                const re = new RegExp(text, String(e.flags || 'i').replace(/[gy]/g, ''));
+                out.push({ label: `/${text}/${e.flags || 'i'}`, test: (t) => re.test(t) });
                 continue;
             } catch {
-                // invalid regex: fall through and treat as plain text
+                // invalid regex: fall back to plain text below
             }
         }
-        const needle = line.toLowerCase();
-        out.push({ label: line, test: (t) => t.toLowerCase().includes(needle) });
+        const needle = text.toLowerCase();
+        out.push({ label: text, test: (t) => t.toLowerCase().includes(needle) });
     }
     return out;
 }
 
-// Returns the first matching entry label, or null.
-function findCustomErrorMatch(text, raw) {
-    if (!text) return null;
-    for (const entry of parseCustomErrors(raw)) {
-        try {
-            if (entry.test(text)) return entry.label;
-        } catch {
-            // ignore a broken entry
+// Make a raw JSON/SSE payload easier to match: also look at the decoded string
+// values (so a phrase containing quotes, newlines or unicode escapes still matches).
+function haystacksFor(...parts) {
+    const out = [];
+    for (const p of parts) {
+        if (typeof p !== 'string' || !p) continue;
+        out.push(p);
+        if (p.includes('\\')) {
+            try {
+                out.push(JSON.parse('"' + p.replace(/"/g, '\\"').replace(/\r?\n/g, '\\n') + '"'));
+            } catch {
+                // ignore
+            }
+        }
+        // Collect every JSON string value found in SSE `data:` lines / a JSON body.
+        const strings = [];
+        const collect = (v) => {
+            if (typeof v === 'string') strings.push(v);
+            else if (Array.isArray(v)) v.forEach(collect);
+            else if (v && typeof v === 'object') Object.values(v).forEach(collect);
+        };
+        for (const line of p.split(/\r?\n/)) {
+            const m = line.match(/^data:\s*(.*)$/);
+            const candidate = (m ? m[1] : line).trim();
+            if (!candidate || (candidate[0] !== '{' && candidate[0] !== '[')) continue;
+            try { collect(JSON.parse(candidate)); } catch { /* ignore */ }
+        }
+        if (strings.length) out.push(strings.join('\n'));
+        // Concatenate streamed text deltas so a phrase split across tokens still matches.
+        const joined = strings.join('');
+        if (joined && joined !== strings.join('\n')) out.push(joined);
+    }
+    return out;
+}
+
+// Returns the first matching entry label, or null. Checks every haystack.
+function findCustomErrorMatch(entries, ...parts) {
+    const compiled = compileEntries(entries);
+    if (!compiled.length) return null;
+    const stacks = haystacksFor(...parts);
+    for (const hay of stacks) {
+        for (const entry of compiled) {
+            try {
+                if (entry.test(hay)) return entry.label;
+            } catch {
+                // ignore a broken entry
+            }
         }
     }
     return null;
@@ -353,7 +409,7 @@ function rebuildResponse(bodyText, response, asStream) {
 //   { verdict: 'error'|'ok'|'ended'|'timeout', error, text, chunks, reader, done }
 // `chunks` are the raw Uint8Arrays read so far (to be replayed), `reader` is
 // the still-open reader (when not done) to be piped through afterwards.
-async function peekStream(response, signal, maxMs, peekCfg = { customErrors: '', scanChars: 0 }) {
+async function peekStream(response, signal, maxMs, peekCfg = { entries: [], scanChars: 0 }) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
@@ -364,19 +420,20 @@ async function peekStream(response, signal, maxMs, peekCfg = { customErrors: '',
     const verdictFor = (final) => {
         const { error, text } = inspectBodyPartial(seen, response.headers.get('content-type') || '', final);
         if (error) return { verdict: 'error', error, text };
+        // Custom entries are matched against the raw payload AND the extracted text, so
+        // they fire on error JSON/SSE events and unknown shapes, not only on reply text.
+        const hit = findCustomErrorMatch(peekCfg.entries, seen, text || '');
+        if (hit) return { verdict: 'error', error: `matched custom error "${hit}"`, text };
+        const hasEntries = compileEntries(peekCfg.entries).length > 0;
         if (text !== null && text.trim().length > 0) {
-            const hit = findCustomErrorMatch(text, peekCfg.customErrors);
-            if (hit) return { verdict: 'error', error: `matched custom error "${hit}"`, text };
             // Keep reading (still buffered, nothing shown yet) until enough text has been
             // scanned, so phrases near the start of a reply are caught before display.
-            if (!final && peekCfg.scanChars > 0 && parseCustomErrors(peekCfg.customErrors).length && text.length < peekCfg.scanChars) {
-                return null;
-            }
+            if (!final && hasEntries && peekCfg.scanChars > 0 && text.length < peekCfg.scanChars) return null;
             return { verdict: 'ok', error: null, text };
         }
         // Reasoning / thinking / tool-call deltas prove the upstream is generating
         // normally, so commit and let them stream live instead of waiting for content.
-        if (/"(reasoning_content|reasoning|thinking|thought|tool_calls|function_call)"\s*:\s*(\[|\{|"[^"])/i.test(seen) && !error) {
+        if (/"(reasoning_content|reasoning|thinking|thought|tool_calls|function_call)"\s*:\s*(\[|\{|"[^"])/i.test(seen)) {
             return { verdict: 'ok', error: null, text };
         }
         return null;
@@ -411,7 +468,7 @@ async function peekStream(response, signal, maxMs, peekCfg = { customErrors: '',
             if (text === null && /^data:/m.test(seen) && !/"tool_calls"|"function_call"|"reasoning|"thinking|"thought/i.test(seen)) {
                 return { verdict: 'error', error: 'stream ended with no content', text: null, chunks, reader, done };
             }
-            return { verdict: 'ended', error: null, text, chunks, reader, done };
+            return { verdict: 'ended', error: null, text, raw: seen, chunks, reader, done };
         }
 
         chunks.push(result.value);
@@ -522,6 +579,7 @@ function installFetchPatch() {
             let bodyError = null;
             let wordCount = null;
             let replyText = null;
+            let rawText = null;
 
             if (!networkError) {
                 const contentType = response.headers.get('content-type') || '';
@@ -530,9 +588,10 @@ function installFetchPatch() {
                 if (isStreamResponse && response.ok && settings.inspectStreams && !settings.holdStreamsForMinWords) {
                     // Live stream: peek only until a verdict, then pass through.
                     try {
-                        const peek = await peekStream(response, externalSignal, Math.max(1000, Number(settings.peekMaxMs) || 15000), { customErrors: settings.customErrors, scanChars: Math.max(0, Number(settings.scanChars) || 0) });
+                        const peek = await peekStream(response, externalSignal, Math.max(1000, Number(settings.peekMaxMs) || 15000), { entries: settings.errorEntries, scanChars: Math.max(0, Number(settings.scanChars) || 0) });
                         bodyError = peek.error;
                         if (peek.verdict === 'ended' && peek.text !== null) { wordCount = countWords(peek.text); replyText = peek.text; }
+                        if (peek.raw) rawText = peek.raw;
                         if (peek.verdict === 'error') {
                             try { peek.reader.cancel(); } catch { /* ignore */ }
                         } else {
@@ -556,6 +615,7 @@ function installFetchPatch() {
                     if (bodyText !== null) {
                         const { error, text } = inspectBody(bodyText, contentType);
                         bodyError = error;
+                        rawText = bodyText;
                         if (text !== null) { wordCount = countWords(text); replyText = text; }
                         finalResponse = rebuildResponse(bodyText, response, isStreamResponse);
                         debugLog('Inspected response:', {
@@ -569,7 +629,7 @@ function installFetchPatch() {
             }
 
             let customHit = null;
-            if (!networkError && replyText !== null) customHit = findCustomErrorMatch(replyText, settings.customErrors);
+            if (!networkError && (replyText !== null || rawText !== null)) customHit = findCustomErrorMatch(settings.errorEntries, rawText || '', replyText || '');
             if (customHit && !bodyError) bodyError = `matched custom error "${customHit}"`;
 
             const isHttpError = !networkError && !response.ok;
@@ -665,10 +725,25 @@ function buildSettingsHtml() {
                     Hold streams to enforce minimum length (buffers the whole reply, so it appears at once instead of live)
                 </label>
 
-                <label>Custom error phrases (one per line, retry if the reply contains any)
-                    <textarea id="retryerr_customErrors" class="text_pole textarea_compact" rows="5" placeholder="I cannot continue with this&#10;as an AI language model&#10;/rate.?limit(ed)?/i">${$('<div>').text(settings.customErrors || '').html()}</textarea>
-                </label>
-                <small>Plain text = case-insensitive match. Wrap in <code>/slashes/</code> for a regex (e.g. <code>/quota|429/i</code>). Lines starting with <code>#</code> are ignored. Applies even when the reply is longer than the minimum word count.</small>
+                <div class="retryerr_entries_header"><b>Custom error entries</b>
+                    <small>If a reply (or raw JSON/SSE response) contains any enabled entry, the request is retried, even if the reply is longer than the minimum word count.</small>
+                </div>
+                <div id="retryerr_entries"></div>
+                <div class="flex-container" style="gap:6px;margin:6px 0;">
+                    <input id="retryerr_newEntry" class="text_pole" type="text" placeholder="Type an error / phrase to catch..." style="flex:1;">
+                    <select id="retryerr_newMode" class="text_pole" style="width:auto;">
+                        <option value="text">Text</option>
+                        <option value="regex">Regex</option>
+                    </select>
+                    <button id="retryerr_addEntry" class="menu_button" type="button" title="Add entry"><i class="fa-solid fa-plus"></i> Add</button>
+                </div>
+
+                <details>
+                    <summary>Test an entry against a response</summary>
+                    <textarea id="retryerr_testInput" class="text_pole textarea_compact" rows="4" placeholder="Paste a raw JSON or SSE response here (e.g. data: {&quot;error&quot;:{&quot;message&quot;:&quot;429&quot;}})"></textarea>
+                    <button id="retryerr_testBtn" class="menu_button" type="button">Test</button>
+                    <small id="retryerr_testResult"></small>
+                </details>
 
                 <label>Phrase scan window for streams (characters)
                     <input id="retryerr_scanChars" class="text_pole" type="number" min="0" max="5000" step="50" value="${settings.scanChars}">
@@ -686,6 +761,29 @@ function buildSettingsHtml() {
             </div>
         </div>
     </div>`;
+}
+
+function escapeAttr(v) {
+    return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderEntries() {
+    const list = getSettings().errorEntries;
+    const host = $('#retryerr_entries');
+    if (!list.length) {
+        host.html('<small><i>No entries yet. Add one below.</i></small>');
+        return;
+    }
+    host.html(list.map((e, i) => `
+        <div class="retryerr_entry flex-container" data-i="${i}" style="gap:6px;align-items:center;margin:3px 0;">
+            <input class="retryerr_entry_enabled" type="checkbox" ${e.enabled === false ? '' : 'checked'} title="Enabled">
+            <input class="retryerr_entry_text text_pole" type="text" value="${escapeAttr(e.text)}" style="flex:1;">
+            <select class="retryerr_entry_mode text_pole" style="width:auto;">
+                <option value="text" ${e.mode === 'regex' ? '' : 'selected'}>Text</option>
+                <option value="regex" ${e.mode === 'regex' ? 'selected' : ''}>Regex</option>
+            </select>
+            <button class="retryerr_entry_delete menu_button" type="button" title="Delete"><i class="fa-solid fa-trash"></i></button>
+        </div>`).join(''));
 }
 
 function wireSettingsInputs() {
@@ -709,9 +807,54 @@ function wireSettingsInputs() {
         getSettings().inspectStreams = $(this).prop('checked');
         saveSettingsDebounced();
     });
-    $('#retryerr_customErrors').on('input', function () {
-        getSettings().customErrors = String($(this).val());
+    renderEntries();
+    const addEntry = () => {
+        const text = String($('#retryerr_newEntry').val() || '').trim();
+        if (!text) return;
+        const mode = $('#retryerr_newMode').val() === 'regex' ? 'regex' : 'text';
+        if (mode === 'regex') {
+            try { new RegExp(text, 'i'); } catch (e) { toast('error', 'Invalid regex: ' + e.message); return; }
+        }
+        getSettings().errorEntries.push({ text, mode, flags: 'i', enabled: true });
         saveSettingsDebounced();
+        $('#retryerr_newEntry').val('');
+        renderEntries();
+    };
+    $('#retryerr_addEntry').on('click', addEntry);
+    $('#retryerr_newEntry').on('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); addEntry(); }
+    });
+    $('#retryerr_entries').on('input', '.retryerr_entry_text', function () {
+        const i = Number($(this).closest('.retryerr_entry').data('i'));
+        const entry = getSettings().errorEntries[i];
+        if (entry) { entry.text = String($(this).val()); saveSettingsDebounced(); }
+    });
+    $('#retryerr_entries').on('change', '.retryerr_entry_mode', function () {
+        const i = Number($(this).closest('.retryerr_entry').data('i'));
+        const entry = getSettings().errorEntries[i];
+        if (entry) { entry.mode = $(this).val() === 'regex' ? 'regex' : 'text'; saveSettingsDebounced(); }
+    });
+    $('#retryerr_entries').on('change', '.retryerr_entry_enabled', function () {
+        const i = Number($(this).closest('.retryerr_entry').data('i'));
+        const entry = getSettings().errorEntries[i];
+        if (entry) { entry.enabled = $(this).prop('checked'); saveSettingsDebounced(); }
+    });
+    $('#retryerr_entries').on('click', '.retryerr_entry_delete', function () {
+        const i = Number($(this).closest('.retryerr_entry').data('i'));
+        getSettings().errorEntries.splice(i, 1);
+        saveSettingsDebounced();
+        renderEntries();
+    });
+    $('#retryerr_testBtn').on('click', function () {
+        const sample = String($('#retryerr_testInput').val() || '');
+        const parsed = inspectBody(sample, '');
+        const hit = findCustomErrorMatch(getSettings().errorEntries, sample, parsed.text || '');
+        const msg = hit
+            ? `Matched entry: ${hit}  → would RETRY`
+            : parsed.error
+                ? `No custom entry matched, but built-in detection sees an error ("${parsed.error}")  → would RETRY`
+                : 'No entry matched and no built-in error found  → would NOT retry';
+        $('#retryerr_testResult').text(msg);
     });
     $('#retryerr_scanChars').on('input', function () {
         getSettings().scanChars = Number($(this).val());

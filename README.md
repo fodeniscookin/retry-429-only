@@ -52,20 +52,23 @@ just enable/disable, max retries, and delay between retries.
 
 ## Changelog
 
-### v2.3.0 — custom error phrases
+### v2.4.0 — custom error entries (list UI) + raw payload matching
 
-- New **Custom error phrases** box in settings: one entry per line, and if the
-  reply contains any of them the request is retried, **even when the reply is
-  longer than the minimum word count**.
-  - Plain text is a case-insensitive "contains" match.
-  - `/pattern/flags` is a regular expression (e.g. `/quota|429/i`).
-  - Lines starting with `#` are ignored; an invalid regex is treated as plain text.
-- Works on non-streaming and streaming replies. For streams, the first N
-  characters (**Phrase scan window**, default 300) are scanned before anything
-  is shown, so a refusal at the start of a reply is retried invisibly, and the
-  rest still streams live. A phrase that only shows up *later* in a stream can
-  be caught only with "Hold streams to enforce minimum length" on (it scans the
-  whole reply, at the cost of live display).
+- **Fixed:** custom entries now match the **raw response**, not just the
+  extracted reply text. A phrase inside an error JSON, an SSE `error` event, an
+  unknown JSON shape, a non-JSON `data:` line or a plain-text body now triggers
+  a retry. Escaped quotes/newlines inside JSON strings and phrases split across
+  streamed tokens are handled too.
+- **New UI:** the one big box is replaced by a list of separate entries. Add
+  them one at a time (Enter or Add), each with its own Text/Regex mode,
+  enable/disable checkbox and delete button. Existing v2.3 entries are migrated
+  automatically.
+- **Test box:** paste a raw JSON/SSE response and see whether any entry (or
+  built-in detection) would trigger a retry.
+- Entries apply even when the reply is longer than the minimum word count.
+- For streams, the first N characters (**Phrase scan window**, default 300) are
+  scanned before anything is shown; a phrase appearing only later in a stream
+  needs "Hold streams to enforce minimum length" on.
 
 ### v2.2.1 — harder error detection on streams
 
