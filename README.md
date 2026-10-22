@@ -52,6 +52,15 @@ just enable/disable, max retries, and delay between retries.
 
 ## Changelog
 
+### v2.2.1 — harder error detection on streams
+
+- Streams that fail in non-JSON ways are now retried too: plain-text `data:`
+  errors (`Error 429 Too Many Requests`), `text/plain` / HTML gateway error
+  pages, and streams that end without any content.
+- Reasoning / thinking / tool-call deltas now commit the stream immediately, so
+  reasoning models display live instead of waiting for the first answer token.
+  (An error that arrives *after* output has started can't be retried invisibly.)
+
 ### v2.2.0 — error detection without giving up streaming
 
 - Streams are no longer fully buffered to inspect them. The extension peeks at

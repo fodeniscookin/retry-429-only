@@ -25,7 +25,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
-const EXT_VERSION = '2.2.0';
+const EXT_VERSION = '2.2.1';
 
 const defaultSettings = {
     enabled: true,
@@ -221,6 +221,13 @@ function extractTextFromObject(obj) {
     return null; // unrecognized shape — don't guess, skip the word-count check
 }
 
+// Plain-text heuristic for errors relayed outside JSON (proxies, gateways, Cloudflare pages).
+function looksLikeErrorText(text) {
+    const t = String(text || '').slice(0, 600);
+    return /\b(429|too many requests|rate[\s_-]?limit|quota|resource[\s_-]?exhausted|overloaded|exceeded|temporarily unavailable|service unavailable|bad gateway|gateway time-?out|internal server error|\b50[0234]\b)\b/i.test(t)
+        || /^\s*<(!doctype|html)/i.test(t);
+}
+
 // Inspect a full response body (JSON or SSE). Returns
 // { error: string|null, text: string|null }.
 function inspectBody(bodyText, contentType) {
@@ -250,7 +257,8 @@ function inspectBody(bodyText, contentType) {
             try {
                 parsed = JSON.parse(payload);
             } catch {
-                if (sawErrorEvent && !error) error = payload.slice(0, 200);
+                // Non-JSON data line: an error if flagged by an `event: error`, or if it reads like one.
+                if ((sawErrorEvent || looksLikeErrorText(payload)) && !error) error = payload.slice(0, 200);
                 continue;
             }
 
@@ -271,6 +279,8 @@ function inspectBody(bodyText, contentType) {
     try {
         parsed = JSON.parse(trimmed);
     } catch {
+        // Not JSON, not SSE: plain text / HTML. Treat as an error only if it reads like one.
+        if (looksLikeErrorText(trimmed)) return { error: trimmed.slice(0, 200), text: null };
         return { error: null, text: null };
     }
     return { error: errorMessageFromObject(parsed), text: extractTextFromObject(parsed) };
@@ -316,6 +326,11 @@ async function peekStream(response, signal, maxMs) {
         const { error, text } = inspectBodyPartial(seen, response.headers.get('content-type') || '', final);
         if (error) return { verdict: 'error', error, text };
         if (text !== null && text.trim().length > 0) return { verdict: 'ok', error: null, text };
+        // Reasoning / thinking / tool-call deltas prove the upstream is generating
+        // normally, so commit and let them stream live instead of waiting for content.
+        if (/"(reasoning_content|reasoning|thinking|thought|tool_calls|function_call)"\s*:\s*(\[|\{|"[^"])/i.test(seen) && !error) {
+            return { verdict: 'ok', error: null, text };
+        }
         return null;
     };
 
@@ -345,6 +360,9 @@ async function peekStream(response, signal, maxMs) {
             if (v) return { ...v, chunks, reader, done };
             const { error, text } = inspectBody(seen, response.headers.get('content-type') || '');
             if (error) return { verdict: 'error', error, text, chunks, reader, done };
+            if (text === null && /^data:/m.test(seen) && !/"tool_calls"|"function_call"|"reasoning|"thinking|"thought/i.test(seen)) {
+                return { verdict: 'error', error: 'stream ended with no content', text: null, chunks, reader, done };
+            }
             return { verdict: 'ended', error: null, text, chunks, reader, done };
         }
 
@@ -472,6 +490,7 @@ function installFetchPatch() {
                             finalResponse = resumeStreamResponse(response, peek.chunks, peek.reader, peek.done);
                         }
                         debugLog('Peeked stream:', { verdict: peek.verdict, bodyError, wordCount });
+                        if (peek.verdict === 'timeout') log('Stream gave no verdict within the peek window; passing it through unchanged.');
                     } catch (err) {
                         if (isAbortError(err)) throw err;
                         debugLog('Peek failed, passing response through:', err);
