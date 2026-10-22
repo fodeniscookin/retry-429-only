@@ -9,12 +9,14 @@
 //      this is the main reason a status-only check never fires), OR
 //   4. the AI's reply text is under the configured minimum word count.
 //
-// Streaming: streamed replies are inspected too. Because an SSE body can only
-// be judged after it has been read, inspection buffers the stream, then hands
-// the caller a fresh streaming response. That is the only way to detect
-// in-stream errors and short replies at all; it can be turned off in settings
-// (Inspect streamed replies), in which case streams are passed through
-// completely untouched and only network errors / HTTP status are checked.
+// Streaming: streams are NEVER fully buffered by default. The extension peeks
+// at the start of the live stream only until it can reach a verdict:
+//   - an error (SSE "error" event, {"error": ...} payload, non-SSE JSON error)
+//     => discard the stream and retry;
+//   - the first real text token => commit, replay the peeked chunks and pipe
+//     the rest of the live body straight through, token by token.
+// Short-reply checking needs the whole reply, so for streams it is a separate
+// opt-in ("Hold streams to check min length"); it is off by default.
 //
 // If the caller passed an AbortSignal (SillyTavern's "Stop" button does this),
 // an abort is never retried — it's immediately propagated so Stop still stops.
@@ -23,7 +25,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE_NAME = 'retry_on_error';
-const EXT_VERSION = '2.1.0';
+const EXT_VERSION = '2.2.0';
 
 const defaultSettings = {
     enabled: true,
@@ -31,6 +33,8 @@ const defaultSettings = {
     delayMs: 2000,
     minWords: 40,
     inspectStreams: true,
+    holdStreamsForMinWords: false,
+    peekMaxMs: 15000,
     debug: false,
 };
 
@@ -293,6 +297,113 @@ function rebuildResponse(bodyText, response, asStream) {
     });
 }
 
+
+// Peek at the start of a live streaming response without destroying
+// streaming. Reads chunks until we can decide: error found, first real text
+// token seen, stream ended, or the peek budget ran out. Returns
+//   { verdict: 'error'|'ok'|'ended'|'timeout', error, text, chunks, reader, done }
+// `chunks` are the raw Uint8Arrays read so far (to be replayed), `reader` is
+// the still-open reader (when not done) to be piped through afterwards.
+async function peekStream(response, signal, maxMs) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let seen = '';
+    let done = false;
+    const started = Date.now();
+
+    const verdictFor = (final) => {
+        const { error, text } = inspectBodyPartial(seen, response.headers.get('content-type') || '', final);
+        if (error) return { verdict: 'error', error, text };
+        if (text !== null && text.trim().length > 0) return { verdict: 'ok', error: null, text };
+        return null;
+    };
+
+    while (true) {
+        if (signal && signal.aborted) {
+            try { reader.cancel(); } catch { /* ignore */ }
+            throw new DOMException('Aborted', 'AbortError');
+        }
+        const remaining = maxMs - (Date.now() - started);
+        if (remaining <= 0) return { verdict: 'timeout', error: null, text: null, chunks, reader, done: false };
+
+        let timer = null;
+        const timeout = new Promise((resolve) => {
+            timer = setTimeout(() => resolve({ timedOut: true }), remaining);
+        });
+        let result;
+        try {
+            result = await Promise.race([reader.read(), timeout]);
+        } finally {
+            clearTimeout(timer);
+        }
+        if (result.timedOut) return { verdict: 'timeout', error: null, text: null, chunks, reader, done: false };
+
+        if (result.done) {
+            done = true;
+            const v = verdictFor(true);
+            if (v) return { ...v, chunks, reader, done };
+            const { error, text } = inspectBody(seen, response.headers.get('content-type') || '');
+            if (error) return { verdict: 'error', error, text, chunks, reader, done };
+            return { verdict: 'ended', error: null, text, chunks, reader, done };
+        }
+
+        chunks.push(result.value);
+        seen += decoder.decode(result.value, { stream: true });
+        const v = verdictFor(false);
+        if (v) return { ...v, chunks, reader, done };
+    }
+}
+
+// Like inspectBody but tolerant of a truncated tail (partial last line).
+function inspectBodyPartial(partialText, contentType, final) {
+    let t = partialText;
+    if (!final) {
+        const lastNl = t.lastIndexOf('\n');
+        t = lastNl === -1 ? '' : t.slice(0, lastNl + 1);
+    }
+    if (!t.trim()) return { error: null, text: null };
+    const r = inspectBody(t, contentType);
+    // A bare non-SSE, non-JSON blob that is still arriving: no verdict yet.
+    return r;
+}
+
+// Build a Response that replays already-read chunks, then keeps piping the
+// live reader, so the consumer still gets tokens in real time.
+function resumeStreamResponse(response, chunks, reader, alreadyDone) {
+    const headers = new Headers(response.headers);
+    headers.delete('content-encoding');
+    headers.delete('content-length');
+    let i = 0;
+    const body = new ReadableStream({
+        async pull(controller) {
+            if (i < chunks.length) {
+                controller.enqueue(chunks[i++]);
+                return;
+            }
+            if (alreadyDone) {
+                controller.close();
+                return;
+            }
+            try {
+                const { done, value } = await reader.read();
+                if (done) controller.close();
+                else controller.enqueue(value);
+            } catch (err) {
+                controller.error(err);
+            }
+        },
+        cancel(reason) {
+            try { return reader.cancel(reason); } catch { return undefined; }
+        },
+    });
+    return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+    });
+}
+
 // ─── Fetch Patch ─────────────────────────────────────────────────────
 
 let originalFetch = null;
@@ -347,10 +458,26 @@ function installFetchPatch() {
 
             if (!networkError) {
                 const contentType = response.headers.get('content-type') || '';
-                const isStreamResponse = wantsStream || contentType.includes('event-stream');
-                const shouldInspect = !isStreamResponse || settings.inspectStreams;
+                const isStreamResponse = (wantsStream || contentType.includes('event-stream')) && !!response.body;
 
-                if (shouldInspect) {
+                if (isStreamResponse && response.ok && settings.inspectStreams && !settings.holdStreamsForMinWords) {
+                    // Live stream: peek only until a verdict, then pass through.
+                    try {
+                        const peek = await peekStream(response, externalSignal, Math.max(1000, Number(settings.peekMaxMs) || 15000));
+                        bodyError = peek.error;
+                        if (peek.verdict === 'ended' && peek.text !== null) wordCount = countWords(peek.text);
+                        if (peek.verdict === 'error') {
+                            try { peek.reader.cancel(); } catch { /* ignore */ }
+                        } else {
+                            finalResponse = resumeStreamResponse(response, peek.chunks, peek.reader, peek.done);
+                        }
+                        debugLog('Peeked stream:', { verdict: peek.verdict, bodyError, wordCount });
+                    } catch (err) {
+                        if (isAbortError(err)) throw err;
+                        debugLog('Peek failed, passing response through:', err);
+                    }
+                } else if (!isStreamResponse || settings.inspectStreams) {
+                    // Non-streaming reply, or the user opted into holding streams for the length check.
                     let bodyText = null;
                     try {
                         bodyText = await response.clone().text();
@@ -458,7 +585,12 @@ function buildSettingsHtml() {
 
                 <label class="checkbox_label">
                     <input id="retryerr_inspectStreams" type="checkbox" ${settings.inspectStreams ? 'checked' : ''}>
-                    Inspect streamed replies (needed to catch in-stream errors and short replies; the reply appears at once instead of token-by-token)
+                    Detect errors in streamed replies (keeps live token-by-token streaming; only peeks at the start of the stream)
+                </label>
+
+                <label class="checkbox_label">
+                    <input id="retryerr_holdStreams" type="checkbox" ${settings.holdStreamsForMinWords ? 'checked' : ''}>
+                    Hold streams to enforce minimum length (buffers the whole reply, so it appears at once instead of live)
                 </label>
 
                 <label class="checkbox_label">
@@ -493,6 +625,10 @@ function wireSettingsInputs() {
     });
     $('#retryerr_inspectStreams').on('change', function () {
         getSettings().inspectStreams = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#retryerr_holdStreams').on('change', function () {
+        getSettings().holdStreamsForMinWords = $(this).prop('checked');
         saveSettingsDebounced();
     });
     $('#retryerr_debug').on('change', function () {

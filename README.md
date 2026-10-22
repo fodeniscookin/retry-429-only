@@ -21,14 +21,19 @@ just enable/disable, max retries, and delay between retries.
   max retries. After that it gives up and hands the last response back to
   SillyTavern so its normal error handling still kicks in.
 - Respects SillyTavern's "Stop" button — an aborted request is never retried.
-- **Never touches real streaming responses.** If the request has
-  `"stream": true`, or the response's content-type is `text/event-stream`,
-  the extension only checks for network errors and non-2xx HTTP status (both
-  known before any body is read) — the live token-by-token stream is
-  returned untouched, so real-time display is fully preserved. The
-  "under 40 words" check only applies to non-streaming replies, since
-  checking it would require reading the whole reply before anything could be
-  displayed.
+- **Keeps real streaming live, and still catches errors.** For streaming
+  requests the extension peeks at the *start* of the live stream only until it
+  can decide: an error (SSE `error` event, `{"error": ...}` payload, or a JSON
+  error body sent with HTTP 200, which is how 429/quota errors usually arrive)
+  discards the stream and retries; the first real text token commits, and the
+  rest of the stream is piped straight through token by token. You do **not**
+  need to disable streaming for error detection.
+- **Minimum length and streams.** The word-count check needs the whole reply,
+  so it always applies to non-streaming replies, but for streams it is opt-in
+  via "Hold streams to enforce minimum length" (off by default), because it
+  requires buffering the full reply. An error that appears *after* text has
+  already started streaming can't be retried (the text is already on screen)
+  and is passed through.
 - Doesn't guess: a tool/function-call response (no text content) or any JSON
   shape it doesn't recognize is left alone rather than being miscounted as
   "0 words" and retried for no reason.
@@ -46,6 +51,15 @@ just enable/disable, max retries, and delay between retries.
    - **Time between retries (ms)** — flat delay before each retry (default 2000ms)
 
 ## Changelog
+
+### v2.2.0 — error detection without giving up streaming
+
+- Streams are no longer fully buffered to inspect them. The extension peeks at
+  the beginning of the live stream, retries on in-body / SSE errors before
+  anything is shown, then passes the rest through in real time.
+- New setting: "Hold streams to enforce minimum length" (off by default) for
+  anyone who wants the short-reply check on streams at the cost of live display.
+- Peek is bounded (15s) so a slow first token never hangs the request.
 
 ### v2.0.1 — streaming & false-positive fixes
 
